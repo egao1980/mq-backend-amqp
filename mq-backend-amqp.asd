@@ -15,12 +15,13 @@
   :in-order-to ((test-op (test-op "mq-backend-amqp/tests"))))
 
 (defsystem "mq-backend-amqp/tests"
-  :depends-on ("mq-backend-amqp" "rove")
+  :depends-on ("mq-backend-amqp" "rove" "usocket")
   :pathname "tests"
   :serial t
   :components ((:file "package")
                (:file "frame-test")
-               (:file "connection-test"))
+               (:file "connection-test")
+               (:file "connect-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))
