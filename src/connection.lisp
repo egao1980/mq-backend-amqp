@@ -50,9 +50,27 @@
   ((stream :initarg :stream :accessor amqp-connection-stream)
    (channel :initarg :channel :accessor amqp-connection-channel :initform 1)
    (frame-max :initarg :frame-max :accessor amqp-connection-frame-max
-              :initform 131072))
+              :initform 131072)
+   (channel-max :initarg :channel-max :accessor amqp-connection-channel-max
+                :initform 0)
+   (heartbeat :initarg :heartbeat :accessor amqp-connection-heartbeat :initform 0
+              :documentation "Negotiated heartbeat interval in seconds (0: off).")
+   (last-sent :initform (get-internal-real-time) :accessor %last-sent)
+   (server-properties :initform nil :accessor amqp-connection-server-properties)
+   (socket :initarg :socket :initform nil :accessor %connection-socket
+           :documentation "The usocket socket when the connection owns one.")
+   (host :initarg :host :initform nil :reader amqp-connection-host)
+   (port :initarg :port :initform nil :reader amqp-connection-port)
+   (channel-open-p :initform t :accessor %channel-open-p)
+   (closed-p :initform nil :accessor amqp-connection-closed-p)
+   (blocked :initform nil :accessor amqp-connection-blocked
+            :documentation "The broker's Connection.Blocked reason while it holds publishers.")
+   (pending :initform '() :accessor %pending-deliveries
+            :documentation "Basic.Deliver messages that arrived while waiting for a reply.")
+   (lock :initform (bt2:make-recursive-lock :name "amqp-connection") :reader %connection-lock))
   (:documentation
-   "AMQP 0-9-1 connection over a bidirectional octet STREAM (or OCTET-PIPE)."))
+   "AMQP 0-9-1 connection over a bidirectional octet STREAM (or OCTET-PIPE).
+OPEN-AMQP-CONNECTION makes one that owns its socket, after the handshake."))
 
 (defun make-amqp-connection (&key stream (channel 1) (frame-max 131072))
   (make-instance 'amqp-connection
@@ -67,6 +85,7 @@
                                   (amqp-frame-payload frame-or-octets))
                     frame-or-octets)))
     (write-amqp-octets (amqp-connection-stream connection) octets)
+    (setf (%last-sent connection) (get-internal-real-time))
     octets))
 
 (defun read-amqp-frame (connection)

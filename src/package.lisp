@@ -58,6 +58,36 @@
 
            #:amqp-backend
            #:make-amqp-backend
-           #:amqp-backend-connection))
+           #:amqp-backend-connection
+           #:amqp-backend-channel
+           #:connect-amqp-backend
+           #:with-amqp-backend
+           #:amqp-declare-queue
+           #:amqp-declare-exchange
+           #:amqp-bind-queue
+
+           #:open-amqp-connection
+           #:close-amqp-connection
+           #:parse-amqp-url
+           #:amqp-rpc
+           #:amqp-heartbeat-tick
+           #:amqp-connection-heartbeat
+           #:amqp-connection-frame-max
+           #:amqp-connection-channel-max
+           #:amqp-connection-server-properties
+           #:amqp-connection-closed-p
+           #:amqp-connection-blocked
+           #:amqp-connection-host
+           #:amqp-connection-port
+           #:*amqp-client-properties*
+
+           #:amqp-transport-error
+           #:amqp-transport-error-cause
+           #:amqp-connection-closed
+           #:amqp-channel-closed
+           #:amqp-reply-code
+           #:amqp-reply-text
+           #:amqp-failing-class-id
+           #:amqp-failing-method-id))
 
 (in-package #:mq-backend-amqp)
