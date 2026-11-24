@@ -219,6 +219,17 @@ protocol header."
 (deftest bad-amqp-url
   (ok (signals (mq-backend-amqp:parse-amqp-url "http://h/") 'mq-protocol:mq-error)))
 
+(deftest-parametrize bad-amqp-url-errors-mask-the-password
+    ((url shown)
+     ("http://app:s3cret@rabbit.internal/" "http://app:***@rabbit.internal/")
+     ("amqp://app:s3cret@/vh" "amqp://app:***@/vh")
+     ("amqps://:p@s3cret@" "amqps://:***@"))
+  ;; #7: AMQP_URL comes from configuration; reports end up in logs.
+  (let ((text (handler-case (progn (mq-backend-amqp:parse-amqp-url url) "no error")
+                (mq-protocol:mq-error (e) (princ-to-string e)))))
+    (ok (not (search "s3cret" text)) (format nil "no password in: ~A" text))
+    (ok (search shown text) (format nil "~A shows ~A" text shown))))
+
 ;;; --- live (RabbitMQ; see connect-test.lisp) ---------------------------------
 
 (defun %live (&rest args)

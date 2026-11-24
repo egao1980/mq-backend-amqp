@@ -56,8 +56,12 @@ The method table covers Connection, Channel, Exchange, Queue, Basic, Confirm and
 | broker `Connection.Close`: bad login (403), unknown vhost (530), forced (320) | `amqp-connection-closed` (`mq-connection-error`) with `amqp-reply-code`, `amqp-reply-text`, `amqp-failing-class-id` / `-method-id` |
 | broker `Channel.Close`: missing queue (404), precondition (406), access (403) | `amqp-channel-closed` with the same readers. The connection stays up and the next operation opens the channel again |
 | malformed frames | `amqp-frame-error` |
+| a frame no request waits for (505 UNEXPECTED_FRAME) | `amqp-frame-error`; the client sends `Connection.Close 505` and drops the socket, so later calls get `mq-connection-error` instead of the wrong reply |
+| any call on a closed connection | `mq-connection-error` |
 
 The broker's `Close` is always answered with `Close-Ok` before the condition is signalled.
+
+**Broker notifications** are nobody's reply, so the call in flight keeps waiting for its own: `Connection.Blocked` / `Unblocked` set `amqp-connection-blocked`; `Basic.Cancel` (Start-Ok asks for `consumer_cancel_notify`, so RabbitMQ sends it when a consumed queue is deleted or its node fails) is answered with `Cancel-Ok` unless it says no-wait, pushes the tag on `amqp-connection-cancelled-consumers` and `signal`s `amqp-consumer-cancelled` (not an error; pika's `on_cancel`); `Channel.Flow` is answered with `Flow-Ok` and sets `amqp-connection-flow-active`.
 
 ## Tests
 

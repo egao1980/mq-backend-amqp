@@ -65,6 +65,12 @@
    (closed-p :initform nil :accessor amqp-connection-closed-p)
    (blocked :initform nil :accessor amqp-connection-blocked
             :documentation "The broker's Connection.Blocked reason while it holds publishers.")
+   (cancelled :initform '() :accessor amqp-connection-cancelled-consumers
+              :documentation "Consumer tags the broker cancelled with Basic.Cancel
+(their queue was deleted, or its node failed), newest first.")
+   (flow-active :initform t :accessor amqp-connection-flow-active
+                :documentation "NIL after a broker Channel.Flow active=false, until it
+sends active=true again.")
    (pending :initform '() :accessor %pending-deliveries
             :documentation "Basic.Deliver messages that arrived while waiting for a reply.")
    (lock :initform (bt2:make-recursive-lock :name "amqp-connection") :reader %connection-lock))

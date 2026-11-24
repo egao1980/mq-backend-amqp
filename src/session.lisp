@@ -36,6 +36,19 @@ credentials or vhost permission), 530 NOT_ALLOWED, 320 CONNECTION_FORCED, ..."))
 PRECONDITION_FAILED, 403 ACCESS_REFUSED. The connection stays up; the next
 operation opens the channel again."))
 
+(define-condition amqp-consumer-cancelled (condition)
+  ((consumer-tag :initarg :consumer-tag :reader amqp-cancelled-consumer-tag)
+   (channel :initarg :channel :reader amqp-cancelled-channel :initform 1))
+  (:report (lambda (c s)
+             (format s "AMQP consumer ~s cancelled by the broker"
+                     (amqp-cancelled-consumer-tag c))))
+  (:documentation "SIGNALled (not an error) when the broker sends Basic.Cancel:
+the consumed queue was deleted or its node failed (RabbitMQ consumer cancel
+notification, which Start-Ok asks for). The tag is also recorded in
+AMQP-CONNECTION-CANCELLED-CONSUMERS and the RPC in flight goes on. A
+handler runs with the connection lock held and must not use the
+connection; pika calls this the on_cancel callback."))
+
 (defun %endpoint (conn)
   (if (amqp-connection-host conn)
       (format nil "~A:~D" (amqp-connection-host conn) (amqp-connection-port conn))
@@ -99,35 +112,60 @@ drops a client silent for two intervals). → T when a heartbeat was sent."
   (setf (%channel-open-p conn) nil)
   (apply #'error 'amqp-channel-closed :message "Channel.Close" (%close-args method)))
 
+(defun %broker-cancelled-consumer (conn frame method)
+  "Basic.Cancel from the broker: answer Cancel-Ok unless it said no-wait
+(RabbitMQ does), record the tag, SIGNAL AMQP-CONSUMER-CANCELLED."
+  (let ((tag (getf (amqp-method-arguments method) :consumer-tag))
+        (channel (amqp-frame-channel frame)))
+    (unless (getf (amqp-method-arguments method) :no-wait)
+      (%with-transport-errors ((%endpoint conn))
+                              (write-amqp-method conn :basic-cancel-ok :channel channel :consumer-tag tag)))
+    (push tag (amqp-connection-cancelled-consumers conn))
+    (signal 'amqp-consumer-cancelled :consumer-tag tag :channel channel)))
+
+(defun %broker-flow (conn frame method)
+  "Channel.Flow from the broker: record it and answer Flow-Ok."
+  (let ((active (getf (amqp-method-arguments method) :active)))
+    (setf (amqp-connection-flow-active conn) (and active t))
+    (%with-transport-errors ((%endpoint conn))
+                            (write-amqp-method conn :channel-flow-ok :channel (amqp-frame-channel frame)
+                                               :active active))))
+
 (defun %next-frame (conn)
-  "The next frame that is not a heartbeat. → (values frame method-or-nil).
-A Connection.Close or Channel.Close from the broker is answered with its
-Close-Ok and signalled; Connection.Blocked / Unblocked are recorded."
+  "The next frame that is not a heartbeat or a broker notification.
+→ (values frame method-or-nil). A Connection.Close or Channel.Close from
+the broker is answered with its Close-Ok and signalled. Connection.Blocked
+/ Unblocked are recorded; Basic.Cancel (consumer cancel notification) and
+Channel.Flow are answered and recorded. None of these is anyone's reply,
+so the RPC in flight keeps waiting for its own."
   (loop
     (let ((frame (%with-transport-errors ((%endpoint conn))
-                   (read-amqp-frame conn))))
+                                         (read-amqp-frame conn))))
       (cond
-        ((heartbeat-frame-p frame))
-        ((/= (amqp-frame-type frame) +amqp-frame-method+)
-         (return (values frame nil)))
-        (t
-         (let ((method (decode-method (amqp-frame-payload frame))))
-           (case (amqp-method-name method)
-             (:connection-close (%broker-closed-connection conn method))
-             (:channel-close (%broker-closed-channel conn frame method))
-             (:connection-blocked
-              (setf (amqp-connection-blocked conn)
-                    (or (getf (amqp-method-arguments method) :reason) t)))
-             (:connection-unblocked
-              (setf (amqp-connection-blocked conn) nil))
-             (t (return (values frame method))))))))))
+       ((heartbeat-frame-p frame))
+       ((/= (amqp-frame-type frame) +amqp-frame-method+)
+        (return (values frame nil)))
+       (t
+        (let ((method (decode-method (amqp-frame-payload frame))))
+          (case (amqp-method-name method)
+            (:connection-close (%broker-closed-connection conn method))
+            (:channel-close (%broker-closed-channel conn frame method))
+            (:connection-blocked
+             (setf (amqp-connection-blocked conn)
+                   (or (getf (amqp-method-arguments method) :reason) t)))
+            (:connection-unblocked
+             (setf (amqp-connection-blocked conn) nil))
+            (:basic-cancel (%broker-cancelled-consumer conn frame method))
+            (:channel-flow (%broker-flow conn frame method))
+            (t (return (values frame method))))))))))
 
 (defun %read-content (conn)
   "The content header and body frames after Basic.Deliver / Get-Ok / Return.
+Any other frame in between is an unexpected frame (%UNEXPECTED-FRAME).
 → (values properties body-octets)."
   (multiple-value-bind (frame method) (%next-frame conn)
     (when (or method (/= (amqp-frame-type frame) +amqp-frame-header+))
-      (error 'amqp-frame-error :message "expected a content header frame"))
+      (%unexpected-frame conn "expected a content header frame"))
     (let* ((header (decode-content-header frame))
            (size (getf header :body-size))
            (body (make-array size :element-type '(unsigned-byte 8)))
@@ -135,7 +173,7 @@ Close-Ok and signalled; Connection.Blocked / Unblocked are recorded."
       (loop while (< filled size)
             do (multiple-value-bind (part method) (%next-frame conn)
                  (when (or method (/= (amqp-frame-type part) +amqp-frame-body+))
-                   (error 'amqp-frame-error :message "expected a content body frame"))
+                   (%unexpected-frame conn "expected a content body frame"))
                  (let ((payload (amqp-frame-payload part)))
                    (replace body payload :start1 filled)
                    (incf filled (length payload)))))
@@ -153,38 +191,61 @@ Close-Ok and signalled; Connection.Blocked / Unblocked are recorded."
      :exchange (getf args :exchange)
      :topic (getf args :routing-key))))
 
+(defun %unexpected-frame (conn text)
+  "A frame that no request is waiting for: AMQP 0-9-1 connection exception
+505 UNEXPECTED_FRAME. Replies after it can no longer be matched to their
+requests, so the client sends Connection.Close 505 (best effort, without
+waiting for Close-Ok), drops the socket and signals AMQP-FRAME-ERROR.
+Later operations on the connection fail with MQ-CONNECTION-ERROR instead
+of reading the wrong reply."
+  (when (%live-p conn)
+    (handler-case
+        (write-amqp-method conn :connection-close :channel 0
+                           :reply-code 505 :reply-text "UNEXPECTED_FRAME"
+                           :class-id 0 :method-id 0)
+      ((or stream-error usocket:socket-error cl+ssl::cl+ssl-error mq-protocol:mq-error) () nil)))
+  (%drop-socket conn)
+  (error 'amqp-frame-error :message text))
+
 (defun %await (conn replies)
   "Read until a method named in REPLIES arrives. Deliveries and returned
-messages that come first are kept or skipped. → (values method frame)."
+messages that come first are kept or skipped. Anything else is an
+unexpected frame (see %UNEXPECTED-FRAME). → (values method frame)."
   (loop
     (multiple-value-bind (frame method) (%next-frame conn)
       (unless method
-        (error 'amqp-frame-error
-               :message (format nil "unexpected frame type ~d while waiting for ~{~s~^ / ~}"
-                                (amqp-frame-type frame) replies)))
+        (%unexpected-frame conn (format nil "unexpected frame type ~d while waiting for ~{~s~^ / ~}"
+                                        (amqp-frame-type frame) replies)))
       (let ((name (amqp-method-name method)))
         (cond
-          ((member name replies) (return (values method frame)))
-          ((eq name :basic-deliver)
-           (multiple-value-bind (properties body) (%read-content conn)
-             (setf (%pending-deliveries conn)
-                   (append (%pending-deliveries conn)
-                           (list (%delivery-message method properties body))))))
-          ((eq name :basic-return)
-           ;; An unroutable mandatory publish coming back: not a reply.
-           (%read-content conn))
-          (t
-           (error 'amqp-frame-error
-                  :message (format nil "unexpected ~s while waiting for ~{~s~^ / ~}"
-                                   name replies))))))))
+         ((member name replies) (return (values method frame)))
+         ((eq name :basic-deliver)
+          (multiple-value-bind (properties body) (%read-content conn)
+            (setf (%pending-deliveries conn)
+                  (append (%pending-deliveries conn)
+                          (list (%delivery-message method properties body))))))
+         ((eq name :basic-return)
+          ;; An unroutable mandatory publish coming back: not a reply.
+          (%read-content conn))
+         (t
+          (%unexpected-frame conn (format nil "unexpected ~s while waiting for ~{~s~^ / ~}"
+                                          name replies))))))))
+
+(defun %check-open (conn)
+  "Signal MQ-CONNECTION-ERROR if CONN was closed (by CLOSE, by the broker,
+or after an unexpected frame)."
+  (when (amqp-connection-closed-p conn)
+    (error 'mq-protocol:mq-connection-error
+           :message (format nil "~A: the AMQP connection is closed" (%endpoint conn)))))
 
 (defun amqp-rpc (connection name replies &rest arguments)
   "Send method NAME (ARGUMENTS: its fields, plus :CHANNEL) and wait for one
 of the method names REPLIES. A broker Close in between is signalled
 (AMQP-CHANNEL-CLOSED / AMQP-CONNECTION-CLOSED). → the reply AMQP-METHOD."
   (bt2:with-recursive-lock-held ((%connection-lock connection))
+    (%check-open connection)
     (%with-transport-errors ((%endpoint connection))
-      (apply #'write-amqp-method connection name arguments))
+                            (apply #'write-amqp-method connection name arguments))
     (values (%await connection replies))))
 
 (defun %ensure-channel (conn)
@@ -265,17 +326,34 @@ answer a bad login with Connection.Close 403 instead of dropping the socket.")
 
 ;;; --- amqp:// URLs ----------------------------------------------------------
 
+(defun %redact-url (url)
+  "URL with the password in its userinfo replaced by ***, for error
+reports: URLs come from configuration and reports end up in logs."
+  (let* ((start (let ((p (search "://" url))) (if p (+ p 3) 0)))
+         (end (or (position-if (lambda (c) (find c "/?#")) url :start start)
+                  (length url)))
+         (at (position #\@ url :start start :end end :from-end t))
+         (colon (and at (position #\: url :start start :end at))))
+    (if colon
+        (concatenate 'string (subseq url 0 (1+ colon)) "***" (subseq url at))
+        url)))
+
 (defun parse-amqp-url (url)
   "Parse amqp://[user[:password]@]host[:port][/vhost] (amqps:// for TLS), the
 RabbitMQ URI spec: the vhost is the percent-decoded path after its first
 \"/\" (\"%2f\" is \"/\"); no path means the default vhost \"/\".
-→ plist :host :port :user :password :vhost :tls."
-  (let* ((uri (quri:uri url))
+→ plist :host :port :user :password :vhost :tls. Errors print the URL with
+the password masked (amqp://user:***@host)."
+  (let* ((shown (%redact-url url))
+         (uri (handler-case (quri:uri url)
+                (error ()
+                  (error 'mq-protocol:mq-error
+                         :message (format nil "malformed URL: ~a" shown)))))
          (scheme (and (quri:uri-scheme uri) (string-downcase (quri:uri-scheme uri)))))
     (unless (member scheme '("amqp" "amqps") :test #'equal)
-      (error 'mq-protocol:mq-error :message (format nil "not an amqp:// or amqps:// URL: ~a" url)))
+      (error 'mq-protocol:mq-error :message (format nil "not an amqp:// or amqps:// URL: ~a" shown)))
     (unless (plusp (length (or (quri:uri-host uri) "")))
-      (error 'mq-protocol:mq-error :message (format nil "no host in ~a" url)))
+      (error 'mq-protocol:mq-error :message (format nil "no host in ~a" shown)))
     (let* ((tls (string= scheme "amqps"))
            (userinfo (quri:uri-userinfo uri))
            (colon (and userinfo (position #\: userinfo)))

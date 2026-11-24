@@ -88,6 +88,11 @@
            #:amqp-reply-code
            #:amqp-reply-text
            #:amqp-failing-class-id
-           #:amqp-failing-method-id))
+           #:amqp-failing-method-id
+           #:amqp-consumer-cancelled
+           #:amqp-cancelled-consumer-tag
+           #:amqp-cancelled-channel
+           #:amqp-connection-cancelled-consumers
+           #:amqp-connection-flow-active))
 
 (in-package #:mq-backend-amqp)

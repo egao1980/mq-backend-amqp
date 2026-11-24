@@ -79,9 +79,11 @@ connection (Connection.Close, socket released) however BODY exits."
 
 (defmacro %with-backend-connection ((conn backend) &body body)
   "Run BODY with CONN, under its lock, after a heartbeat tick and, on a live
-connection, with the channel (re)opened."
+connection, with the channel (re)opened. A closed connection signals
+MQ-CONNECTION-ERROR."
   `(let ((,conn (%conn ,backend)))
      (bt2:with-recursive-lock-held ((%connection-lock ,conn))
+       (%check-open ,conn)
        (when (%live-p ,conn)
          (amqp-heartbeat-tick ,conn)
          (%ensure-channel ,conn))
