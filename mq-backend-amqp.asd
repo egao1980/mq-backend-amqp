@@ -3,8 +3,9 @@
   :description "Pure CL AMQP 0-9-1 backend for mq-protocol: framing, handshake (SASL PLAIN), heartbeats, Basic.Get, TLS through cl-stack-ssl (RabbitMQ target)"
   :author "egao1980"
   :license "MIT"
+  ;; binary-protocol 0.1.1 unpacks IEEE infinity / NaN (binary-protocol#5);
   ;; quri 0.7.2 parses userinfo before an IPv6 literal (cl-stack-systems#85).
-  :depends-on ("mq-protocol" "binary-protocol" "encoding-protocol" "usocket"
+  :depends-on ("mq-protocol" (:version "binary-protocol" "0.1.1") "encoding-protocol" "usocket"
                (:version "quri" "0.7.2")
                "cl-stack-ssl" "bordeaux-threads")
   :serial t

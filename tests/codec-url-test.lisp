@@ -52,6 +52,19 @@
              (eql 6 (mq-backend-amqp:amqp-frame-error-offset e)))
         "at the offset of the type octet")))
 
+(deftest-parametrize ieee-specials-in-a-field-table-are-no-arithmetic-errors
+    ((what octets)
+     ;; {"x": d +infinity}, {"x": d NaN}, {"x": f -infinity}: pika refuses
+     ;; to encode these, the Java client and RabbitMQ do not.
+     ("double +infinity" #(0 0 0 11 1 120 100 127 240 0 0 0 0 0 0))
+     ("double NaN" #(0 0 0 11 1 120 100 127 248 0 0 0 0 0 0))
+     ("single -infinity" #(0 0 0 7 1 120 102 255 128 0 0)))
+  (let ((got (handler-case (cdr (first (%read-table octets)))
+               (mq-protocol:mq-error () :refused)
+               (error (e) (list :escaped (type-of e))))))
+    (ok (or (floatp got) (eq :refused got))
+        (format nil "~A decodes to a float or is an mq-error (got ~S)" what got))))
+
 (deftest a-float-header-survives-the-content-header
   (let* ((frame (mq-backend-amqp:encode-content-header
                  :class-id 60 :body-size 0 :channel 1
