@@ -200,6 +200,14 @@ there, which is why the backend reads byte-wise on Windows."
       (ok (eq :other-channel (%refusal (lambda () (mq-protocol:ack b2 m1)))))
       (ok (null (%acks out))))))
 
+(deftest subscribe-with-prefetch-sends-basic-qos-first
+  (multiple-value-bind (conn out) (%scripted (%frames))
+    (let ((b (mq-backend-amqp:make-amqp-backend :connection conn)))
+      (mq-protocol:subscribe b "q" (lambda (m) (declare (ignore m))) :no-wait t :prefetch 10)
+      (let ((w (%written out)))
+        (ok (equal '(:basic-qos :basic-consume) (%names w)))
+        (ok (eql 10 (getf (%args w :basic-qos) :prefetch-count)))))))
+
 (deftest a-frame-over-frame-max-is-refused-before-its-payload
   ;; A peer that is not an AMQP broker: "HTTP/1.1 400" read as a frame
   ;; header says 1 345 270 062 octets (#x502F312E, "P/1.") follow.
@@ -220,3 +228,32 @@ there, which is why the backend reads byte-wise on Windows."
   (let ((e (handler-case (progn (mq-backend-amqp:parse-amqp-url '(:password "s3cret")) nil)
              (mq-protocol:mq-error (e) (princ-to-string e)))))
     (ok (and e (not (search "s3cret" e))) (format nil "an mq-error that hides it (~A)" e))))
+
+#+sbcl
+(deftest a-password-given-as-a-function-stays-out-of-the-backtrace
+  ;; A refused login (403 inside the handshake) with the password as a
+  ;; function: no frame of the backtrace prints it.
+  (multiple-value-bind (port thread)
+      (%serve-once (lambda (srv socket)
+                     (declare (ignore socket))
+                     (mq-backend-amqp:read-amqp-octets (mq-backend-amqp:amqp-connection-stream srv) 8)
+                     (%send srv (first (%broker-hello)))
+                     (%client-method srv)
+                     (%send srv '(:connection-close 0 :reply-code 403
+                                  :reply-text "ACCESS_REFUSED" :class-id 0 :method-id 0))
+                     (%client-method srv)))
+    (let ((trace (block trace
+                   (handler-bind ((mq-protocol:mq-connection-error
+                                    (lambda (c)
+                                      (declare (ignore c))
+                                      (return-from trace
+                                        (with-output-to-string (s)
+                                          (sb-debug:print-backtrace :stream s :count 60))))))
+                     (mq-backend-amqp:connect-amqp-backend
+                      :url (format nil "amqp://app@127.0.0.1:~D/prod" port)
+                      :password (lambda () "pw-s3cret") :connect-timeout 3)
+                     nil))))
+      (ok trace "the login was refused")
+      (ok (and trace (not (search "pw-s3cret" trace)))
+          "no frame of the backtrace prints the password")
+      (bt2:join-thread thread))))

@@ -148,19 +148,32 @@ fails instead of being discarded. → the MQ-MESSAGE."
     msg))
 
 (defmethod mq-protocol:subscribe ((backend amqp-backend) destination handler &key
-                                  (consumer-tag "") no-ack no-wait)
+                                  (consumer-tag "") no-ack no-wait prefetch)
   "Basic.Consume on queue DESTINATION. On a live connection the broker's
 Consume-Ok is awaited (unless NO-WAIT) and its consumer tag kept; with
-NO-WAIT and no CONSUMER-TAG the client picks the tag (cl-stack.ctag.N), so
-every consumer's queue is known. Messages delivered to it are handed out by
-POLL-MESSAGES of DESTINATION. With NO-ACK they are settled on arrival, and
-ACK / NACK of one signals AMQP-STALE-DELIVERY."
+NO-WAIT and no CONSUMER-TAG the client picks the tag (cl-stack.ctag.N, never
+reused on the connection), so every consumer's queue is known. Consumer
+tags are channel-local: the consumer is recorded on the backend's channel,
+until the broker cancels it or the channel closes. Messages delivered to it
+are handed out by POLL-MESSAGES of DESTINATION on that channel. With NO-ACK
+they are settled on arrival, and ACK / NACK of one signals
+AMQP-STALE-DELIVERY. PREFETCH (a count) sends Basic.Qos first: the broker
+then has at most that many unacked deliveries out on the channel, which
+bounds what a consumer of a busy queue holds (without it, RabbitMQ pushes
+everything)."
   (let ((tag consumer-tag)
-        (queue (%dest-string destination)))
+        (queue (%dest-string destination))
+        (channel (amqp-backend-channel backend)))
     (%with-backend-connection (conn backend)
+      (when prefetch
+        (check-type prefetch (integer 0 65535))
+        (let ((qos (list :channel channel :prefetch-size 0 :prefetch-count prefetch :global nil)))
+          (if (%live-p conn)
+              (apply #'amqp-rpc conn :basic-qos '(:basic-qos-ok) qos)
+              (apply #'write-amqp-method conn :basic-qos qos))))
       (when (and no-wait (or (null tag) (string= tag "")))
-        (setf tag (format nil "cl-stack.ctag.~D" (1+ (length (%consumer-queues conn))))))
-      (let ((args (list :channel (amqp-backend-channel backend)
+        (setf tag (format nil "cl-stack.ctag.~D" (incf (%consumer-count conn)))))
+      (let ((args (list :channel channel
                         :queue queue
                         :consumer-tag (or tag "")
                         :no-local nil
@@ -173,9 +186,10 @@ ACK / NACK of one signals AMQP-STALE-DELIVERY."
                             :consumer-tag))
             (apply #'write-amqp-method conn :basic-consume args))
         (when (and tag (string/= tag ""))
-          (push (cons tag queue) (%consumer-queues conn))
+          (%forget-consumer conn channel tag)
+          (push (cons tag queue) (%consumer-queues conn channel))
           (when no-ack
-            (push tag (%no-ack-consumers conn))))))
+            (push tag (%no-ack-consumers conn channel))))))
     (make-instance 'mq-protocol:mq-subscription
                    :destination destination
                    :handler handler
@@ -407,10 +421,11 @@ the backend's channel (to a consumer on it, see SUBSCRIBE) come first,
 then Basic.Get. Messages of other queues stay for polls of those queues.
 With TIMEOUT (seconds) an empty queue is retried until a message arrives or
 the time is up; without it one attempt is made. Broker notifications read
-meanwhile are signalled before the messages are returned (a multiple ack
-from a handler does not cover them: they are not handed out yet); if a
-handler unwinds, the messages are kept for the next poll of DESTINATION,
-not lost."
+meanwhile are signalled before the messages are returned. Until they are
+returned the messages are not handed out: from the moment they are taken
+(under the connection lock) a multiple ack on any thread does not cover
+them, and if a handler unwinds, or the poll fails half way, they are kept
+for the next poll of DESTINATION, not lost."
   (check-type n (integer 1))
   (let* ((queue (%dest-string destination))
          (channel (amqp-backend-channel backend))
@@ -420,38 +435,40 @@ not lost."
                            (round (* timeout internal-time-units-per-second)))))
          (out '())
          (handed-out nil))
-    (let ((*amqp-operation-depth* (1+ *amqp-operation-depth*)))
-      (loop
-        (%with-backend-connection (conn backend)
-          (unless (%live-p conn)
-            (error 'mq-protocol:mq-error
-                   :backend backend
-                   :message "poll-messages needs a broker: open the backend with :host or :url"))
-          (setf out (append out (%take-pending conn queue (- n (length out)) channel)))
-          (loop while (< (length out) n)
-                do (let ((msg (%basic-get backend conn queue)))
-                     (if msg
-                         (setf out (append out (list msg)))
-                         (return)))))
-        (when (or out
-                  (null deadline)
-                  (>= (get-internal-real-time) deadline))
-          (return))
-        (sleep (min 0.05 (/ (max 0 (- deadline (get-internal-real-time)))
-                            internal-time-units-per-second)))))
-    (bt2:with-recursive-lock-held ((%connection-lock conn))
-      (setf (%handing-out conn) (append out (%handing-out conn))))
-    (unwind-protect
-        (progn
-          (when (zerop *amqp-operation-depth*)
-            (%signal-notifications conn))
-          (setf handed-out t)
-          out)
-      (bt2:with-recursive-lock-held ((%connection-lock conn))
-        (setf (%handing-out conn)
-              (remove-if (lambda (m) (member m out)) (%handing-out conn))))
-      (unless handed-out
-        (%hold-back conn out)))))
+    (flet ((take (messages)
+             ;; Under the connection lock: in OUT and in %HANDING-OUT at once.
+             (setf out (append out messages)
+                   (%handing-out conn) (append messages (%handing-out conn)))))
+      (unwind-protect
+          (progn
+            (let ((*amqp-operation-depth* (1+ *amqp-operation-depth*)))
+              (loop
+                (%with-backend-connection (conn backend)
+                  (unless (%live-p conn)
+                    (error 'mq-protocol:mq-error
+                           :backend backend
+                           :message "poll-messages needs a broker: open the backend with :host or :url"))
+                  (take (%take-pending conn queue (- n (length out)) channel))
+                  (loop while (< (length out) n)
+                        do (let ((msg (%basic-get backend conn queue)))
+                             (if msg
+                                 (take (list msg))
+                                 (return)))))
+                (when (or out
+                          (null deadline)
+                          (>= (get-internal-real-time) deadline))
+                  (return))
+                (sleep (min 0.05 (/ (max 0 (- deadline (get-internal-real-time)))
+                                    internal-time-units-per-second)))))
+            (when (zerop *amqp-operation-depth*)
+              (%signal-notifications conn))
+            (setf handed-out t)
+            out)
+        (bt2:with-recursive-lock-held ((%connection-lock conn))
+          (setf (%handing-out conn)
+                (remove-if (lambda (m) (member m out)) (%handing-out conn))))
+        (unless handed-out
+          (%hold-back conn out))))))
 
 (defmethod mq-protocol:ack ((backend amqp-backend) message &key multiple)
   "Basic.Ack of MESSAGE (an AMQP-DELIVERY, a copy of one, or an integer tag

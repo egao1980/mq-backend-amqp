@@ -160,8 +160,10 @@ of any channel is signalled.")
 (defun %retired-p (conn message)
   "Was delivery MESSAGE handed out on a channel of CONN that has closed
 since? The broker requeued it then: its tag now names nothing, or another
-message."
+message. A no-ack consumer's delivery is not retired: the broker settled
+it on sending, so the close requeued nothing, and dropping it would lose it."
   (and (typep message 'amqp-delivery)
+       (not (eq :no-ack (%delivery-settled message)))
        (integerp (mq-protocol:mq-message-delivery-tag message))
        (<= (mq-protocol:mq-message-delivery-tag message)
            (%cs-offset (%channel-state conn (%delivery-channel message))))))
@@ -171,10 +173,13 @@ message."
 their tags die with it. The tags handed out are retired (the channel's
 offset becomes its highest tag, so ACK of one signals AMQP-STALE-DELIVERY
 instead of acking whatever the reopened channel delivers under the same
-number), and its deliveries not handed out yet are dropped."
+number), its deliveries not handed out yet are dropped (no-ack ones
+excepted, see %RETIRED-P), and its consumers are gone."
   (let ((state (%channel-state conn channel)))
     (setf (%cs-open-p state) nil
-          (%cs-offset state) (%cs-max-tag state))
+          (%cs-offset state) (%cs-max-tag state)
+          (%cs-consumers state) '()
+          (%cs-no-ack state) '())
     (clrhash (%cs-unsettled state))
     (setf (%pending-deliveries conn)
           (remove-if (lambda (m) (%retired-p conn m)) (%pending-deliveries conn)))))
@@ -236,15 +241,18 @@ more for that request, so the connection stays in step."
 
 (defun %broker-cancelled-consumer (conn frame method)
   "Basic.Cancel from the broker: answer Cancel-Ok unless it said no-wait
-(RabbitMQ does), record the tag, and queue AMQP-CONSUMER-CANCELLED for
-%SIGNAL-NOTIFICATIONS. It is not signalled here: a reply may be in flight,
-and a handler that unwound from inside the read would leave it unread."
+(RabbitMQ does), record the tag, forget the consumer on its channel (its
+tag may be used again; its deliveries already read keep their queue), and
+queue AMQP-CONSUMER-CANCELLED for %SIGNAL-NOTIFICATIONS. It is not
+signalled here: a reply may be in flight, and a handler that unwound from
+inside the read would leave it unread."
   (let ((tag (getf (amqp-method-arguments method) :consumer-tag))
         (channel (amqp-frame-channel frame)))
     (unless (getf (amqp-method-arguments method) :no-wait)
       (%with-transport-errors ((%endpoint conn))
-                              (write-amqp-method conn :basic-cancel-ok :channel channel :consumer-tag tag)))
+        (write-amqp-method conn :basic-cancel-ok :channel channel :consumer-tag tag)))
     (push tag (amqp-connection-cancelled-consumers conn))
+    (%forget-consumer conn channel tag)
     (setf (%pending-notifications conn)
           (append (%pending-notifications conn)
                   (list (list 'amqp-consumer-cancelled :consumer-tag tag :channel channel))))))
@@ -290,62 +298,95 @@ this is on there.")
 
 (defclass %deadline-reader ()
   ((conn :initarg :conn :reader %dr-conn)
-   (deadline :initarg :deadline :reader %dr-deadline
-             :documentation "Internal real time.")
-   (seconds :initarg :seconds :reader %dr-seconds)
+   (seconds :initarg :seconds :reader %dr-seconds
+            :documentation "How long the socket may give nothing (NIL: only LIMIT).")
+   (limit :initarg :limit :initform nil :reader %dr-limit
+          :documentation "NIL, or the internal real time by which all reads are done.")
+   (byte-wise :initarg :byte-wise :initform nil :reader %dr-byte-wise-p)
    (what :initarg :what :reader %dr-what))
-  (:documentation "A READ-AMQP-OCTETS source over CONN's plain socket stream
-that never waits past DEADLINE: each octet is read once the socket has one.
-Past DEADLINE the socket is dropped and AMQP-TRANSPORT-ERROR signalled, as
-by %CALL-WITH-DEADLINE."))
+  (:documentation "A READ-AMQP-OCTETS source over CONN's socket stream that
+gives up when the socket gives nothing for SECONDS, or at LIMIT: the socket
+is dropped and AMQP-TRANSPORT-ERROR signalled. Octets that keep coming are
+waited for however long the frame takes (pika's heartbeat checker counts
+octets too), and heartbeats are sent meanwhile. BYTE-WISE: each octet is
+read once usocket's WAIT-FOR-INPUT says the socket has one (plain sockets
+on Windows, see *BYTE-WISE-DEADLINE-READS*); otherwise chunks of 4096
+octets are read, each under SB-SYS:WITH-DEADLINE (%CALL-WITH-DEADLINE)."))
 
 (defmethod read-amqp-octets ((source %deadline-reader) n)
-  (let* ((conn (%dr-conn source))
-         (stream (amqp-connection-stream conn))
-         (socket (%connection-socket conn))
-         (buf (make-array n :element-type '(unsigned-byte 8))))
-    (dotimes (i n buf)
-      (loop until (listen stream)
-            do (let ((left (/ (- (%dr-deadline source) (get-internal-real-time))
-                              internal-time-units-per-second)))
-                 (unless (plusp left)
-                   (%drop-socket conn)
-                   (error 'amqp-transport-error
-                          :message (format nil "~A: ~A within ~,1F s"
-                                           (%endpoint conn) (%dr-what source) (%dr-seconds source))))
-                 ;; Ready is an octet or the end of the stream: READ-BYTE
-                 ;; does not block then.
-                 (when (usocket:wait-for-input socket :timeout (float left) :ready-only t)
-                   (return))))
-      (let ((octet (read-byte stream nil nil)))
-        (unless octet
-          (error 'mq-protocol:mq-connection-error
-                 :message (format nil "unexpected EOF (got ~D of ~D)" i n)))
-        (setf (aref buf i) octet)))))
+  (let ((conn (%dr-conn source))
+        (buf (make-array n :element-type '(unsigned-byte 8))))
+    (flet ((window ()
+             ;; Seconds from now until the reader gives up, if nothing comes.
+             (let ((limit (and (%dr-limit source)
+                               (/ (- (%dr-limit source) (get-internal-real-time))
+                                  internal-time-units-per-second)))
+                   (seconds (%dr-seconds source)))
+               (max 0 (if (and limit seconds) (min limit seconds) (or limit seconds)))))
+           (eof (got)
+             (error 'amqp-transport-error
+                    :message (format nil "~A: unexpected EOF (got ~D of ~D)" (%endpoint conn) got n))))
+      (if (%dr-byte-wise-p source)
+          (let ((stream (amqp-connection-stream conn))
+                (socket (%connection-socket conn))
+                (deadline nil))
+            (dotimes (i n buf)
+              (setf deadline nil)
+              (loop until (listen stream)
+                    do (let ((left (if deadline
+                                       (/ (- deadline (get-internal-real-time))
+                                          internal-time-units-per-second)
+                                       (let ((w (window)))
+                                         (setf deadline (+ (get-internal-real-time)
+                                                           (round (* w internal-time-units-per-second))))
+                                         w))))
+                         (unless (plusp left)
+                           (%drop-socket conn)
+                           (error 'amqp-transport-error
+                                  :message (format nil "~A: ~A within ~,1F s"
+                                                   (%endpoint conn) (%dr-what source) (window))))
+                         (amqp-heartbeat-tick conn)
+                         ;; Ready is an octet or the end of the stream:
+                         ;; READ-BYTE does not block then.
+                         (when (usocket:wait-for-input socket :timeout (float (min left 0.5))
+                                                              :ready-only t)
+                           (return))))
+              (let ((octet (read-byte stream nil nil)))
+                (unless octet (eof i))
+                (setf (aref buf i) octet))))
+          (let ((stream (amqp-connection-stream conn)))
+            (loop with start = 0
+                  while (< start n)
+                  do (let ((end (min n (+ start 4096))))
+                       (amqp-heartbeat-tick conn)
+                       (%call-with-deadline (window) (%endpoint conn) (%dr-what source)
+                                            (lambda ()
+                                              (let ((got (read-sequence buf stream :start start :end end)))
+                                                (unless (= got end) (eof got))))
+                                            :conn conn)
+                       (setf start end)))
+            buf)))))
 
 (defun %read-frame-within (conn seconds what)
-  "READ-AMQP-FRAME on CONN, given up after SECONDS (NIL: no limit) or at
-*READ-DEADLINE*, whichever is sooner: the socket is dropped and
-AMQP-TRANSPORT-ERROR signalled (\"WHAT within SECONDS s\"). A plain socket
-under *BYTE-WISE-DEADLINE-READS* is read through a %DEADLINE-READER; anything
-else through %CALL-WITH-DEADLINE."
-  (let* ((outer (and *read-deadline*
-                     (/ (- *read-deadline* (get-internal-real-time))
-                        internal-time-units-per-second)))
-         (what (if (and outer (or (null seconds) (< outer seconds))) "no AMQP handshake" what))
-         (seconds (if (and seconds outer) (min seconds outer) (or seconds outer))))
-    (if (and seconds
-             *byte-wise-deadline-reads*
-             (%connection-socket conn)
-             (not (typep (amqp-connection-stream conn) 'cl+ssl::ssl-stream)))
+  "READ-AMQP-FRAME on CONN, given up when the socket gives nothing for
+SECONDS (NIL: no limit) or at *READ-DEADLINE*: the socket is dropped and
+AMQP-TRANSPORT-ERROR signalled (\"WHAT within N s\"). A frame whose octets
+keep coming is waited for (%DEADLINE-READER). Without a socket, or with no
+bound at all, it is a plain READ-AMQP-FRAME."
+  (if (and (%connection-socket conn) (or seconds *read-deadline*))
+      (let ((handshake (and *read-deadline*
+                            (or (null seconds)
+                                (< (- *read-deadline* (get-internal-real-time))
+                                   (* seconds internal-time-units-per-second))))))
         (read-amqp-frame conn (make-instance '%deadline-reader
-                                             :conn conn :what what :seconds (max seconds 0)
-                                             :deadline (+ (get-internal-real-time)
-                                                          (round (* (max seconds 0)
-                                                                    internal-time-units-per-second)))))
-        (%call-with-deadline (and seconds (max seconds 0)) (%endpoint conn) what
-                             (lambda () (read-amqp-frame conn))
-                             :conn conn))))
+                                             :conn conn
+                                             :seconds seconds
+                                             :limit *read-deadline*
+                                             :what (if handshake "no AMQP handshake" what)
+                                             :byte-wise (and *byte-wise-deadline-reads*
+                                                             (not (typep (amqp-connection-stream conn)
+                                                                         'cl+ssl::ssl-stream))))))
+      (read-amqp-frame conn)))
 
 (defun %readable-within-p (conn seconds)
   "Does the broker on CONN's socket send something within SECONDS? Plain
@@ -480,24 +521,28 @@ unique on the channel after that."))
 
 (defun %delivery-queue (conn message)
   "The queue MESSAGE came from: its Basic.Get queue, or the queue its
-consumer reads (recorded by SUBSCRIBE). NIL when unknown."
-  (or (and (typep message 'amqp-delivery) (%delivery-get-queue message))
-      (and (typep message 'amqp-delivery)
-           (cdr (assoc (amqp-delivery-consumer-tag message) (%consumer-queues conn)
+consumer read when it was delivered (recorded on it, from SUBSCRIBE), or
+failing that the queue of that consumer on its own channel. NIL when
+unknown."
+  (and (typep message 'amqp-delivery)
+       (or (%delivery-get-queue message)
+           (cdr (assoc (amqp-delivery-consumer-tag message)
+                       (%consumer-queues conn (%delivery-channel message))
                        :test #'equal)))))
 
 (defun %delivery-message (conn channel method properties body &key queue)
   "An AMQP-DELIVERY on CONN's CHANNEL for a Basic.Deliver (it names its
-consumer) or a Basic.Get-Ok (QUEUE is the queue it was got from) and its
-content. Its delivery tag is the wire tag plus the channel's offset (see
-AMQP-DELIVERY); unless its consumer is no-ack, the broker now waits for its
-ack, so the tag is unsettled."
+consumer, and the queue that consumer reads on CHANNEL is recorded on it)
+or a Basic.Get-Ok (QUEUE is the queue it was got from) and its content. Its
+delivery tag is the wire tag plus the channel's offset (see AMQP-DELIVERY);
+unless its consumer is no-ack, the broker now waits for its ack, so the tag
+is unsettled."
   (let* ((args (amqp-method-arguments method))
          (consumer (getf args :consumer-tag))
          (state (%channel-state conn channel))
          (tag (+ (%cs-offset state) (getf args :delivery-tag)))
          (no-ack (and consumer
-                      (member consumer (%no-ack-consumers conn) :test #'equal)
+                      (member consumer (%cs-no-ack state) :test #'equal)
                       t)))
     (setf (%cs-max-tag state) (max tag (%cs-max-tag state)))
     (unless no-ack
@@ -511,7 +556,9 @@ ack, so the tag is unsettled."
                    :exchange (getf args :exchange)
                    :topic (getf args :routing-key)
                    :consumer-tag consumer
-                   :queue queue
+                   :queue (or queue
+                              (and consumer
+                                   (cdr (assoc consumer (%cs-consumers state) :test #'equal))))
                    :connection conn
                    :channel channel
                    :settled (and no-ack :no-ack))))
@@ -539,10 +586,8 @@ Basic.Deliver is kept with its content for POLL-MESSAGES, a Basic.Return
   (case (amqp-method-name method)
     (:basic-deliver
      (multiple-value-bind (properties body) (%read-content conn)
-       (setf (%pending-deliveries conn)
-             (append (%pending-deliveries conn)
-                     (list (%delivery-message conn (amqp-frame-channel frame)
-                                              method properties body)))))
+       (%enqueue-delivery conn (%delivery-message conn (amqp-frame-channel frame)
+                                                  method properties body)))
      t)
     (:basic-return
      (%read-content conn)
@@ -616,29 +661,32 @@ open (the broker closed it, or no one opened it yet) is opened."
       (amqp-rpc conn :channel-open '(:channel-open-ok) :channel channel :reserved-1 "")))
   conn)
 
-(defun %drain-incoming (conn channel)
+(defun %drain-incoming (conn channel &key (limit 64))
   "Read what the broker already sent on CONN, without waiting: deliveries
 are kept, heartbeats and notifications handled, and a broker Close is
 signalled now, a Channel.Close of CHANNEL (the operation's own) included,
 rather than after more requests went to a channel the broker closed and
 discards. pika's BlockingConnection reads at every call too, so a publish
-after the broker closed its channel fails instead of vanishing. A reply
+after the broker closed its channel fails instead of vanishing. At most
+LIMIT deliveries are read: with a consumer on a queue that keeps filling
+the socket is never quiet, and the operation must still run (what is left
+is read by the next one, or by an RPC on its way to its reply). A reply
 here answers no request: an unexpected frame. Run at the start of every
 backend operation on a live connection; the caller holds the lock."
   (let ((*awaited-channel* channel))
     (%with-reply-guard (conn)
-      (loop
-        (multiple-value-bind (frame method) (%next-frame conn :poll t)
-          (cond
-           ((null frame) (return))
-           ((null method)
-            (%unexpected-frame conn (format nil "unexpected frame type ~D, no request waits for it"
-                                            (amqp-frame-type frame))))
-           ((%incidental-frame conn frame method))
-           (t
-            (%unexpected-frame conn (format nil "unexpected ~S on channel ~D, no request waits for it"
-                                            (amqp-method-name method)
-                                            (amqp-frame-channel frame))))))))))
+      (loop repeat limit
+            do (multiple-value-bind (frame method) (%next-frame conn :poll t)
+                 (cond
+                   ((null frame) (return))
+                   ((null method)
+                    (%unexpected-frame conn (format nil "unexpected frame type ~D, no request waits for it"
+                                                    (amqp-frame-type frame))))
+                   ((%incidental-frame conn frame method))
+                   (t
+                    (%unexpected-frame conn (format nil "unexpected ~S on channel ~D, no request waits for it"
+                                                    (amqp-method-name method)
+                                                    (amqp-frame-channel frame))))))))))
 
 ;;; --- handshake -------------------------------------------------------------
 
@@ -657,9 +705,12 @@ answer a bad login with Connection.Close 403 instead of dropping the socket.")
   (encoding-protocol:encode (or string "") :encoding :utf-8))
 
 (defun %plain-response (user password)
-  "SASL PLAIN (RFC 4616): NUL user NUL password, UTF-8."
+  "SASL PLAIN (RFC 4616): NUL user NUL password, UTF-8. PASSWORD may be a
+function of no arguments that returns it, called only here: the frames of a
+backtrace then show the function, not the password."
   (concatenate '(simple-array (unsigned-byte 8) (*))
-               #(0) (%utf8 user) #(0) (%utf8 password)))
+               #(0) (%utf8 user) #(0)
+               (%utf8 (if (functionp password) (funcall password) password))))
 
 (defun %negotiate (client server)
   "Tune value: 0 means no limit on that side; otherwise the lower wins."
