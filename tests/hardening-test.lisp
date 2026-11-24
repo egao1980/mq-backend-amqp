@@ -85,6 +85,86 @@
           (format nil "an mq-connection-error (got ~S: ~A)" (and e (type-of e)) e))
       (bt2:join-thread thread))))
 
+;;; SBCL's deadlines do not bound a plain socket read on Windows; there the
+;;; frame reads wait for each octet instead (*BYTE-WISE-DEADLINE-READS*).
+;;; These run that path on every OS.
+
+(defmacro with-reads ((mode) &body body)
+  `(let ((mq-backend-amqp::*byte-wise-deadline-reads* (eq ,mode :byte-wise)))
+     ,@body))
+
+(deftest-parametrize a-frame-cut-short-fails-in-either-read-mode
+    ((mode) (:byte-wise) (:deadline))
+  (with-reads (mode)
+    (multiple-value-bind (port thread)
+        (%serve-once (lambda (srv socket)
+                       (declare (ignore socket))
+                       (%fake-handshake srv :heartbeat 1)
+                       (%client-method srv)
+                       (mq-backend-amqp:write-amqp-octets (mq-backend-amqp:amqp-connection-stream srv)
+                                                          (subseq (%frames (%declare-ok "q")) 0 4))
+                       (sleep 6)))
+      (let* ((b (mq-backend-amqp:connect-amqp-backend :host "127.0.0.1" :port port :heartbeat 1))
+             (start (get-internal-real-time))
+             (e (handler-case (progn (mq-backend-amqp:amqp-declare-queue b "q") nil)
+                  (mq-protocol:mq-error (e) e)))
+             (waited (%seconds-since start)))
+        (ok (typep e 'mq-backend-amqp:amqp-transport-error)
+            (format nil "~S: amqp-transport-error (got ~S: ~A)" mode (and e (type-of e)) e))
+        (ok (< waited 4) (format nil "~S: after two 1 s intervals (~,1F s)" mode waited))
+        (close b)
+        (bt2:join-thread thread)))))
+
+(deftest-parametrize a-close-ok-cut-short-gives-up-in-either-read-mode
+    ((mode) (:byte-wise) (:deadline))
+  (with-reads (mode)
+    (multiple-value-bind (port thread)
+        (%serve-once (lambda (srv socket)
+                       (declare (ignore socket))
+                       (%fake-handshake srv :heartbeat 0)
+                       (loop until (eq :connection-close (%client-method srv)))
+                       (mq-backend-amqp:write-amqp-octets (mq-backend-amqp:amqp-connection-stream srv)
+                                                          (subseq (%frames '(:connection-close-ok 0)) 0 4))
+                       (sleep 8)))
+      (let* ((b (mq-backend-amqp:connect-amqp-backend :host "127.0.0.1" :port port :heartbeat 0))
+             (start (get-internal-real-time)))
+        (close b)
+        (ok (< (%seconds-since start) 6.5)
+            (format nil "~S: close returns within about 5 s (~,1F s)" mode (%seconds-since start)))
+        (bt2:join-thread thread)))))
+
+(deftest-parametrize a-silent-plain-server-fails-the-connect-in-either-read-mode
+    ((mode) (:byte-wise) (:deadline))
+  (with-reads (mode)
+    (multiple-value-bind (port thread)
+        (%serve-once (lambda (srv socket)
+                       (declare (ignore srv socket))
+                       (sleep 6)))
+      (let* ((start (get-internal-real-time))
+             (e (handler-case
+                    (progn (close (mq-backend-amqp:connect-amqp-backend
+                                   :host "127.0.0.1" :port port :connect-timeout 2))
+                      nil)
+                  (mq-protocol:mq-error (e) e)))
+             (waited (%seconds-since start)))
+        (ok (typep e 'mq-protocol:mq-connection-error)
+            (format nil "~S: an mq-connection-error (got ~S: ~A)" mode (and e (type-of e)) e))
+        (ok (< waited 4) (format nil "~S: within the 2 s connect-timeout (~,1F s)" mode waited))
+        (bt2:join-thread thread)))))
+
+(deftest live-byte-wise-reads-carry-a-large-message
+  (with-broker ()
+    (with-reads (:byte-wise)
+      (mq-backend-amqp:with-amqp-backend (b :host (%host) :port (%port)
+                                            :user (%user) :password (%password) :heartbeat 5)
+        (let ((q (mq-backend-amqp:amqp-declare-queue b "" :exclusive t :auto-delete t))
+              (big (make-array 400000 :element-type '(unsigned-byte 8) :initial-element 9)))
+          (mq-protocol:publish b q (mq-protocol:make-mq-message :payload big))
+          (let ((got (first (mq-protocol:poll-messages b q :timeout 3))))
+            (ok (and got (equalp big (mq-protocol:mq-message-payload got)))
+                "a 400 000-byte message read octet by octet under heartbeat deadlines")
+            (when got (mq-protocol:ack b got))))))))
+
 (deftest another-channels-close-is-not-this-requests-answer
   (multiple-value-bind (conn out)
       (%scripted (%frames '(:channel-close 2 :reply-code 404 :reply-text "NOT_FOUND"

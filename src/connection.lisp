@@ -139,12 +139,14 @@ OPEN-AMQP-CONNECTION makes one that owns its socket, after the handshake."))
     (setf (%last-sent connection) (get-internal-real-time))
     octets))
 
-(defun read-amqp-frame (connection)
-  "The next frame. One larger than the connection's frame-max (the client's
-before Tune, the negotiated one after; 0: no limit) is an AMQP-FRAME-ERROR
-before its payload is read: no peer may send one, and a non-AMQP peer (an
-HTTP port) would otherwise make it allocate whatever its first octets say."
-  (let* ((header (read-amqp-octets (amqp-connection-stream connection) 7))
+(defun read-amqp-frame (connection &optional (source (amqp-connection-stream connection)))
+  "The next frame, read from SOURCE (the connection's stream, or anything
+with a READ-AMQP-OCTETS method). One larger than the connection's
+frame-max (the client's before Tune, the negotiated one after; 0: no
+limit) is an AMQP-FRAME-ERROR before its payload is read: no peer may send
+one, and a non-AMQP peer (an HTTP port) would otherwise make it allocate
+whatever its first octets say."
+  (let* ((header (read-amqp-octets source 7))
          (size (first (binary-protocol:unpack "!I" header :start 3)))
          (frame-max (amqp-connection-frame-max connection)))
     (when (and (plusp frame-max) (> (+ size 8) frame-max))
@@ -152,7 +154,7 @@ HTTP port) would otherwise make it allocate whatever its first octets say."
              :offset 3
              :message (format nil "a frame of ~D octets is over the frame-max ~D (not an AMQP 0-9-1 peer?)"
                               (+ size 8) frame-max)))
-    (let* ((rest (read-amqp-octets (amqp-connection-stream connection) (1+ size)))
+    (let* ((rest (read-amqp-octets source (1+ size)))
            (octets (concatenate '(simple-array (unsigned-byte 8) (*)) header rest)))
       (decode-frame octets))))
 

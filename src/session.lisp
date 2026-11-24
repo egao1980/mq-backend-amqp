@@ -276,6 +276,77 @@ waits through it too); elsewhere THUNK runs unbounded."
         #-sbcl
         (funcall thunk))))
 
+(defvar *read-deadline* nil
+  "NIL, or the internal real time by which reads must be done whatever the
+heartbeat: OPEN-AMQP-CONNECTION binds it to its CONNECT-TIMEOUT for the
+handshake (%READ-FRAME-WITHIN).")
+
+(defvar *byte-wise-deadline-reads* #+(and sbcl win32) t #-(and sbcl win32) nil
+  "Bound a plain socket's frame reads by waiting for each octet (usocket
+WAIT-FOR-INPUT, %DEADLINE-READER) rather than by SB-SYS:WITH-DEADLINE.
+SBCL's deadlines bound TLS reads everywhere (cl+ssl waits through
+SB-SYS:WAIT-UNTIL-FD-USABLE) but not a plain socket read on Windows, so
+this is on there.")
+
+(defclass %deadline-reader ()
+  ((conn :initarg :conn :reader %dr-conn)
+   (deadline :initarg :deadline :reader %dr-deadline
+             :documentation "Internal real time.")
+   (seconds :initarg :seconds :reader %dr-seconds)
+   (what :initarg :what :reader %dr-what))
+  (:documentation "A READ-AMQP-OCTETS source over CONN's plain socket stream
+that never waits past DEADLINE: each octet is read once the socket has one.
+Past DEADLINE the socket is dropped and AMQP-TRANSPORT-ERROR signalled, as
+by %CALL-WITH-DEADLINE."))
+
+(defmethod read-amqp-octets ((source %deadline-reader) n)
+  (let* ((conn (%dr-conn source))
+         (stream (amqp-connection-stream conn))
+         (socket (%connection-socket conn))
+         (buf (make-array n :element-type '(unsigned-byte 8))))
+    (dotimes (i n buf)
+      (loop until (listen stream)
+            do (let ((left (/ (- (%dr-deadline source) (get-internal-real-time))
+                              internal-time-units-per-second)))
+                 (unless (plusp left)
+                   (%drop-socket conn)
+                   (error 'amqp-transport-error
+                          :message (format nil "~A: ~A within ~,1F s"
+                                           (%endpoint conn) (%dr-what source) (%dr-seconds source))))
+                 ;; Ready is an octet or the end of the stream: READ-BYTE
+                 ;; does not block then.
+                 (when (usocket:wait-for-input socket :timeout (float left) :ready-only t)
+                   (return))))
+      (let ((octet (read-byte stream nil nil)))
+        (unless octet
+          (error 'mq-protocol:mq-connection-error
+                 :message (format nil "unexpected EOF (got ~D of ~D)" i n)))
+        (setf (aref buf i) octet)))))
+
+(defun %read-frame-within (conn seconds what)
+  "READ-AMQP-FRAME on CONN, given up after SECONDS (NIL: no limit) or at
+*READ-DEADLINE*, whichever is sooner: the socket is dropped and
+AMQP-TRANSPORT-ERROR signalled (\"WHAT within SECONDS s\"). A plain socket
+under *BYTE-WISE-DEADLINE-READS* is read through a %DEADLINE-READER; anything
+else through %CALL-WITH-DEADLINE."
+  (let* ((outer (and *read-deadline*
+                     (/ (- *read-deadline* (get-internal-real-time))
+                        internal-time-units-per-second)))
+         (what (if (and outer (or (null seconds) (< outer seconds))) "no AMQP handshake" what))
+         (seconds (if (and seconds outer) (min seconds outer) (or seconds outer))))
+    (if (and seconds
+             *byte-wise-deadline-reads*
+             (%connection-socket conn)
+             (not (typep (amqp-connection-stream conn) 'cl+ssl::ssl-stream)))
+        (read-amqp-frame conn (make-instance '%deadline-reader
+                                             :conn conn :what what :seconds (max seconds 0)
+                                             :deadline (+ (get-internal-real-time)
+                                                          (round (* (max seconds 0)
+                                                                    internal-time-units-per-second)))))
+        (%call-with-deadline (and seconds (max seconds 0)) (%endpoint conn) what
+                             (lambda () (read-amqp-frame conn))
+                             :conn conn))))
+
 (defun %readable-within-p (conn seconds)
   "Does the broker on CONN's socket send something within SECONDS? Plain
 TCP waits on the socket. TLS polls the TLS stream's own non-blocking
@@ -334,8 +405,9 @@ Connection.Blocked / Unblocked are recorded; Basic.Cancel (consumer cancel
 notification) and Channel.Flow are answered and recorded. None of these is
 anyone's reply, so the RPC in flight keeps waiting for its own. A broker
 silent for two heartbeat intervals is gone (%WAIT-FOR-FRAME), and so is
-one that stops for that long in the middle of a frame. With POLL, nothing
-is waited for: → (values NIL NIL) when the broker has sent nothing more."
+one that stops for that long in the middle of a frame (%READ-FRAME-WITHIN).
+With POLL, nothing is waited for: → (values NIL NIL) when the broker has
+sent nothing more."
   (loop
     (when (and poll
                (not (%with-transport-errors ((%endpoint conn))
@@ -344,29 +416,27 @@ is waited for: → (values NIL NIL) when the broker has sent nothing more."
     (let* ((interval (amqp-connection-heartbeat conn))
            (frame (%with-transport-errors ((%endpoint conn))
                     (%wait-for-frame conn)
-                    (%call-with-deadline (and (%connection-socket conn) (plusp interval)
-                                              (* 2 interval))
-                                         (%endpoint conn)
-                                         "the rest of a frame did not come (two heartbeat intervals)"
-                                         (lambda () (read-amqp-frame conn))
-                                         :conn conn))))
+                    (%read-frame-within conn
+                                        (and (%connection-socket conn) (plusp interval)
+                                             (* 2 interval))
+                                        "the rest of a frame did not come (two heartbeat intervals)"))))
       (cond
-       ((heartbeat-frame-p frame))
-       ((/= (amqp-frame-type frame) +amqp-frame-method+)
-        (return (values frame nil)))
-       (t
-        (let ((method (decode-method (amqp-frame-payload frame))))
-          (case (amqp-method-name method)
-            (:connection-close (%broker-closed-connection conn method))
-            (:channel-close (%broker-closed-channel conn frame method))
-            (:connection-blocked
-             (setf (amqp-connection-blocked conn)
-                   (or (getf (amqp-method-arguments method) :reason) t)))
-            (:connection-unblocked
-             (setf (amqp-connection-blocked conn) nil))
-            (:basic-cancel (%broker-cancelled-consumer conn frame method))
-            (:channel-flow (%broker-flow conn frame method))
-            (t (return (values frame method))))))))))
+        ((heartbeat-frame-p frame))
+        ((/= (amqp-frame-type frame) +amqp-frame-method+)
+         (return (values frame nil)))
+        (t
+         (let ((method (decode-method (amqp-frame-payload frame))))
+           (case (amqp-method-name method)
+             (:connection-close (%broker-closed-connection conn method))
+             (:channel-close (%broker-closed-channel conn frame method))
+             (:connection-blocked
+              (setf (amqp-connection-blocked conn)
+                    (or (getf (amqp-method-arguments method) :reason) t)))
+             (:connection-unblocked
+              (setf (amqp-connection-blocked conn) nil))
+             (:basic-cancel (%broker-cancelled-consumer conn frame method))
+             (:channel-flow (%broker-flow conn frame method))
+             (t (return (values frame method))))))))))
 
 (defun %read-content (conn)
   "The content header and body frames after Basic.Deliver / Get-Ok / Return.
@@ -759,33 +829,40 @@ both MQ-CONNECTION-ERRORs."
              (done nil))
         (unwind-protect
             (%with-transport-errors (endpoint)
-              (%call-with-deadline
-               connect-timeout endpoint "no AMQP handshake"
-               (lambda ()
-                 (let ((stream (if tls
-                                   (cl+ssl:make-ssl-client-stream (usocket:socket-stream socket)
-                                                                  :hostname host
-                                                                  :verify tls-verify)
-                                   (usocket:socket-stream socket))))
-                   (setf conn (make-instance 'amqp-connection
-                                             :stream stream :socket socket
-                                             :host host :port port :channel channel))
-                   ;; A malformed frame before the handshake is done means the
-                   ;; peer is no AMQP 0-9-1 broker (a TLS port spoken to in
-                   ;; plain, an HTTP port): a connection error, as a refused
-                   ;; connect is.
-                   (handler-case
-                       (%handshake conn :user (opt :user "guest") :password (opt :password "guest")
-                                        :vhost (opt :vhost "/") :heartbeat heartbeat
-                                        :frame-max frame-max :channel-max channel-max
-                                        :locale locale :client-properties client-properties)
-                     (amqp-frame-error (e)
-                       (error 'amqp-transport-error
-                              :message (format nil "~A: not an AMQP 0-9-1 broker (~A)"
-                                               endpoint (mq-protocol:mq-error-message e))
-                              :cause e)))
-                   (setf done t)
-                   conn))))
+              ;; Two bounds, one deadline: SB-SYS:WITH-DEADLINE for the TLS
+              ;; handshake and SBCL's waits, *READ-DEADLINE* for frame reads
+              ;; that it does not bound (%READ-FRAME-WITHIN).
+              (let ((*read-deadline* (and connect-timeout
+                                          (+ (get-internal-real-time)
+                                             (round (* connect-timeout
+                                                       internal-time-units-per-second))))))
+                (%call-with-deadline
+                 connect-timeout endpoint "no AMQP handshake"
+                 (lambda ()
+                   (let ((stream (if tls
+                                     (cl+ssl:make-ssl-client-stream (usocket:socket-stream socket)
+                                                                    :hostname host
+                                                                    :verify tls-verify)
+                                     (usocket:socket-stream socket))))
+                     (setf conn (make-instance 'amqp-connection
+                                               :stream stream :socket socket
+                                               :host host :port port :channel channel))
+                     ;; A malformed frame before the handshake is done means the
+                     ;; peer is no AMQP 0-9-1 broker (a TLS port spoken to in
+                     ;; plain, an HTTP port): a connection error, as a refused
+                     ;; connect is.
+                     (handler-case
+                         (%handshake conn :user (opt :user "guest") :password (opt :password "guest")
+                                          :vhost (opt :vhost "/") :heartbeat heartbeat
+                                          :frame-max frame-max :channel-max channel-max
+                                          :locale locale :client-properties client-properties)
+                       (amqp-frame-error (e)
+                         (error 'amqp-transport-error
+                                :message (format nil "~A: not an AMQP 0-9-1 broker (~A)"
+                                                 endpoint (mq-protocol:mq-error-message e))
+                                :cause e)))
+                     (setf done t)
+                     conn)))))
           (unless done
             (if conn
                 (%drop-socket conn)
@@ -800,10 +877,7 @@ On a socket (plain or TLS) each frame, first octet to last, waits at most
     (when (and (%connection-socket conn)
                (not (%readable-within-p conn 5)))
       (return nil))
-    (let ((frame (%call-with-deadline (and (%connection-socket conn) 5)
-                                      (%endpoint conn) "no Close-Ok"
-                                      (lambda () (read-amqp-frame conn))
-                                      :conn conn)))
+    (let ((frame (%read-frame-within conn (and (%connection-socket conn) 5) "no Close-Ok")))
       (when (= (amqp-frame-type frame) +amqp-frame-method+)
         (case (amqp-method-name (decode-method (amqp-frame-payload frame)))
           (:connection-close-ok (return t))
