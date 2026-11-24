@@ -90,8 +90,13 @@
 ;;; These run that path on every OS.
 
 (defmacro with-reads ((mode) &body body)
-  `(let ((mq-backend-amqp::*byte-wise-deadline-reads* (eq ,mode :byte-wise)))
-     ,@body))
+  "Run BODY with frame reads in MODE, :BYTE-WISE or :DEADLINE. :DEADLINE is
+skipped on Windows: SBCL's with-deadline does not bound a plain socket read
+there, which is why the backend reads byte-wise on Windows."
+  `(if (and (eq ,mode :deadline) (uiop:os-windows-p))
+       (skip "with-deadline does not bound plain socket reads on Windows (byte-wise reads are used there)")
+       (let ((mq-backend-amqp::*byte-wise-deadline-reads* (eq ,mode :byte-wise)))
+         ,@body)))
 
 (deftest-parametrize a-frame-cut-short-fails-in-either-read-mode
     ((mode) (:byte-wise) (:deadline))
