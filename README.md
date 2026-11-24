@@ -26,7 +26,7 @@ Pure Common Lisp **AMQP 0-9-1** backend for [`mq-protocol`](https://github.com/e
 | `:host` `:port` | `"127.0.0.1"`, 5672 (5671 with TLS) | |
 | `:user` `:password` | `"guest"` | SASL PLAIN (UTF-8) |
 | `:vhost` | `"/"` | |
-| `:url` | | `amqp[s]://user:pass@host:port/vhost` (RabbitMQ URI spec: `%2f` is `/`; no path is `/`). Explicit keywords win |
+| `:url` | | `amqp[s]://user:pass@host:port/vhost` (RabbitMQ URI spec: `%2f` is `/`; no path is `/`). User and password are percent-decoded: write `/ ? # @ %` in them as `%2F %3F %23 %40 %25`; errors mask the password. Explicit keywords win |
 | `:tls` `:tls-verify` | `nil` `:required` | cl+ssl client stream with SNI and hostname check |
 | `:heartbeat` | broker's (`nil`) | seconds; `0` turns heartbeats off; otherwise the lower of ours and the broker's |
 | `:frame-max` `:channel-max` | `131072` `0` | negotiated with the broker's Tune |
@@ -40,7 +40,7 @@ Pure Common Lisp **AMQP 0-9-1** backend for [`mq-protocol`](https://github.com/e
 ## Operations
 
 - `publish` → `Basic.Publish` + content header + body frames split at the negotiated `frame-max`. The destination is a queue name (default exchange) or `(exchange . routing-key)`; `mq-message-key` travels as `correlation-id`, `mq-message-headers` as headers.
-- `poll-messages destination &key n timeout` → `Basic.Get` (not auto-acked). With `:timeout` an empty queue is retried until a message arrives or the time is up.
+- `poll-messages destination &key n timeout` → messages already delivered to a consumer of `destination` on this connection, then `Basic.Get` (not auto-acked). Deliveries for other queues stay for polls of those queues. With `:timeout` an empty queue is retried until a message arrives or the time is up.
 - `ack` / `nack` (`:requeue`) → `Basic.Ack` / `Basic.Nack` by delivery tag.
 - `subscribe` → `Basic.Consume`, waiting for `Consume-Ok`. Deliveries that arrive while the backend waits for a reply are kept and handed out by `poll-messages`; there is no push dispatch loop yet.
 - `amqp-declare-queue` (→ name, message count, consumer count), `amqp-declare-exchange`, `amqp-bind-queue`: synchronous, waiting for their `-Ok`.
@@ -59,9 +59,9 @@ The method table covers Connection, Channel, Exchange, Queue, Basic, Confirm and
 | a frame no request waits for (505 UNEXPECTED_FRAME) | `amqp-frame-error`; the client sends `Connection.Close 505` and drops the socket, so later calls get `mq-connection-error` instead of the wrong reply |
 | any call on a closed connection | `mq-connection-error` |
 
-The broker's `Close` is always answered with `Close-Ok` before the condition is signalled.
+The broker's `Close` is always answered with `Close-Ok` before the condition is signalled. A call left by a non-local exit (an interrupt, a handler that unwinds) before its reply was read drops the connection, so later calls fail with `mq-connection-error` instead of reading that reply; a broker `Channel.Close` is a complete answer and keeps the connection.
 
-**Broker notifications** are nobody's reply, so the call in flight keeps waiting for its own: `Connection.Blocked` / `Unblocked` set `amqp-connection-blocked`; `Basic.Cancel` (Start-Ok asks for `consumer_cancel_notify`, so RabbitMQ sends it when a consumed queue is deleted or its node fails) is answered with `Cancel-Ok` unless it says no-wait, pushes the tag on `amqp-connection-cancelled-consumers` and `signal`s `amqp-consumer-cancelled` (not an error; pika's `on_cancel`); `Channel.Flow` is answered with `Flow-Ok` and sets `amqp-connection-flow-active`.
+**Broker notifications** are nobody's reply, so the call in flight keeps waiting for its own: `Connection.Blocked` / `Unblocked` set `amqp-connection-blocked`; `Basic.Cancel` (Start-Ok asks for `consumer_cancel_notify`, so RabbitMQ sends it when a consumed queue is deleted or its node fails) is answered with `Cancel-Ok` unless it says no-wait, pushes the tag on `amqp-connection-cancelled-consumers` and queues `amqp-consumer-cancelled` (not an error; pika's `on_cancel`). That condition is `signal`led once the operation that read the cancel has its reply (the outermost backend call of the thread), with no lock held and no reply in flight, so a handler may use the connection or unwind; a `poll-messages` it unwinds keeps its messages for the next poll of that queue; `Channel.Flow` is answered with `Flow-Ok` and sets `amqp-connection-flow-active`.
 
 ## Tests
 

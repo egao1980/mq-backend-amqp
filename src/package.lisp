@@ -93,6 +93,8 @@
            #:amqp-cancelled-consumer-tag
            #:amqp-cancelled-channel
            #:amqp-connection-cancelled-consumers
-           #:amqp-connection-flow-active))
+           #:amqp-connection-flow-active
+           #:amqp-delivery
+           #:amqp-delivery-consumer-tag))
 
 (in-package #:mq-backend-amqp)

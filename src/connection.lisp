@@ -72,7 +72,15 @@
                 :documentation "NIL after a broker Channel.Flow active=false, until it
 sends active=true again.")
    (pending :initform '() :accessor %pending-deliveries
-            :documentation "Basic.Deliver messages that arrived while waiting for a reply.")
+            :documentation "Delivered messages not handed out yet, oldest first:
+Basic.Deliver frames that arrived while waiting for a reply, and messages a
+POLL-MESSAGES fetched but could not hand out. Each is handed out by a poll
+of its own queue (%DELIVERY-QUEUE).")
+   (consumer-queues :initform '() :accessor %consumer-queues
+                    :documentation "(consumer-tag . queue) for each SUBSCRIBE on this connection.")
+   (notifications :initform '() :accessor %pending-notifications
+                  :documentation "Broker notifications to signal, oldest first, as
+(condition-type . initargs): see %SIGNAL-NOTIFICATIONS.")
    (lock :initform (bt2:make-recursive-lock :name "amqp-connection") :reader %connection-lock))
   (:documentation
    "AMQP 0-9-1 connection over a bidirectional octet STREAM (or OCTET-PIPE).

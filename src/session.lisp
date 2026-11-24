@@ -42,12 +42,15 @@ operation opens the channel again."))
   (:report (lambda (c s)
              (format s "AMQP consumer ~s cancelled by the broker"
                      (amqp-cancelled-consumer-tag c))))
-  (:documentation "SIGNALled (not an error) when the broker sends Basic.Cancel:
+  (:documentation "SIGNALled (not an error) after the broker sent Basic.Cancel:
 the consumed queue was deleted or its node failed (RabbitMQ consumer cancel
-notification, which Start-Ok asks for). The tag is also recorded in
-AMQP-CONNECTION-CANCELLED-CONSUMERS and the RPC in flight goes on. A
-handler runs with the connection lock held and must not use the
-connection; pika calls this the on_cancel callback."))
+notification, which Start-Ok asks for). The tag is recorded in
+AMQP-CONNECTION-CANCELLED-CONSUMERS at once; the condition is signalled when
+the operation that read the cancel has its reply (the outermost backend
+operation of the thread, or AMQP-RPC), with no lock held and no reply in
+flight, as pika runs on_cancel after dispatching the frame. A handler may
+use the connection, or unwind: POLL-MESSAGES keeps the messages it had
+fetched for the next poll of that queue."))
 
 (defun %endpoint (conn)
   (if (amqp-connection-host conn)
@@ -108,20 +111,68 @@ drops a client silent for two intervals). → T when a heartbeat was sent."
   (apply #'error 'amqp-connection-closed :message "Connection.Close" (%close-args method)))
 
 (defun %broker-closed-channel (conn frame method)
+  "Channel.Close from the broker: answer Close-Ok and signal it. The
+broker requeues the channel's unacked messages, so the delivered messages
+not handed out yet are dropped: their delivery tags died with the channel."
   (write-amqp-method conn :channel-close-ok :channel (amqp-frame-channel frame))
-  (setf (%channel-open-p conn) nil)
+  (setf (%channel-open-p conn) nil
+        (%pending-deliveries conn) '())
   (apply #'error 'amqp-channel-closed :message "Channel.Close" (%close-args method)))
+
+(defvar *amqp-operation-depth* 0
+  "How many backend operations (or AMQP-RPCs) this thread is inside.
+Broker notifications are signalled when the outermost one is done.")
+
+(defun %signal-notifications (conn)
+  "SIGNAL the broker notifications queued on CONN, oldest first, with no
+lock held and no reply in flight. One a handler unwinds from is consumed;
+the rest stay queued for the end of the next operation."
+  (loop for note = (bt2:with-recursive-lock-held ((%connection-lock conn))
+                     (pop (%pending-notifications conn)))
+        while note
+        do (apply #'signal note)))
+
+(defmacro %with-notifications ((conn) &body body)
+  "Run BODY one operation deeper; when the outermost operation returns
+normally, signal CONN's queued broker notifications (%SIGNAL-NOTIFICATIONS).
+CONN is evaluated after BODY."
+  `(multiple-value-prog1
+       (let ((*amqp-operation-depth* (1+ *amqp-operation-depth*)))
+         ,@body)
+     (when (zerop *amqp-operation-depth*)
+       (%signal-notifications ,conn))))
+
+(defmacro %with-reply-guard ((conn) &body body)
+  "Run BODY, which reads a reply off CONN. Leaving BODY by a non-local exit
+before it returns (an interrupt, a handler that unwinds) may leave part of
+the reply unread, and the next request would read it as its own. The
+connection is then dropped, so later operations fail with
+MQ-CONNECTION-ERROR. The broker's Channel.Close (AMQP-CHANNEL-CLOSED) is
+the exception: it was answered with Close-Ok and the broker sends nothing
+more for that request, so the connection stays in step."
+  (let ((done (gensym "DONE")) (in-step (gensym "IN-STEP")))
+    `(let ((,done nil) (,in-step nil))
+       (unwind-protect
+           (handler-bind ((amqp-channel-closed
+                           (lambda (c) (declare (ignore c)) (setf ,in-step t))))
+             (multiple-value-prog1 (progn ,@body) (setf ,done t)))
+         (unless (or ,done ,in-step)
+           (%drop-socket ,conn))))))
 
 (defun %broker-cancelled-consumer (conn frame method)
   "Basic.Cancel from the broker: answer Cancel-Ok unless it said no-wait
-(RabbitMQ does), record the tag, SIGNAL AMQP-CONSUMER-CANCELLED."
+(RabbitMQ does), record the tag, and queue AMQP-CONSUMER-CANCELLED for
+%SIGNAL-NOTIFICATIONS. It is not signalled here: a reply may be in flight,
+and a handler that unwound from inside the read would leave it unread."
   (let ((tag (getf (amqp-method-arguments method) :consumer-tag))
         (channel (amqp-frame-channel frame)))
     (unless (getf (amqp-method-arguments method) :no-wait)
       (%with-transport-errors ((%endpoint conn))
                               (write-amqp-method conn :basic-cancel-ok :channel channel :consumer-tag tag)))
     (push tag (amqp-connection-cancelled-consumers conn))
-    (signal 'amqp-consumer-cancelled :consumer-tag tag :channel channel)))
+    (setf (%pending-notifications conn)
+          (append (%pending-notifications conn)
+                  (list (list 'amqp-consumer-cancelled :consumer-tag tag :channel channel))))))
 
 (defun %broker-flow (conn frame method)
   "Channel.Flow from the broker: record it and answer Flow-Ok."
@@ -179,17 +230,37 @@ Any other frame in between is an unexpected frame (%UNEXPECTED-FRAME).
                    (incf filled (length payload)))))
       (values (getf header :properties) body))))
 
-(defun %delivery-message (method properties body)
-  "An MQ-MESSAGE for a Basic.Deliver / Get-Ok and its content."
+(defclass amqp-delivery (mq-protocol:mq-message)
+  ((consumer-tag :initarg :consumer-tag :initform nil
+                 :reader amqp-delivery-consumer-tag
+                 :documentation "The consumer a Basic.Deliver was for; NIL for Basic.Get.")
+   (queue :initarg :queue :initform nil :reader %delivery-get-queue
+          :documentation "The queue of a Basic.Get-Ok."))
+  (:documentation "A message the broker delivered: an MQ-MESSAGE that also
+knows its consumer, so POLL-MESSAGES hands it out for its own queue only."))
+
+(defun %delivery-queue (conn message)
+  "The queue MESSAGE came from: its Basic.Get queue, or the queue its
+consumer reads (recorded by SUBSCRIBE). NIL when unknown."
+  (or (and (typep message 'amqp-delivery) (%delivery-get-queue message))
+      (and (typep message 'amqp-delivery)
+           (cdr (assoc (amqp-delivery-consumer-tag message) (%consumer-queues conn)
+                       :test #'equal)))))
+
+(defun %delivery-message (method properties body &key queue)
+  "An AMQP-DELIVERY for a Basic.Deliver (it names its consumer) or a
+Basic.Get-Ok (QUEUE is the queue it was got from) and its content."
   (let ((args (amqp-method-arguments method)))
-    (mq-protocol:make-mq-message
-     :key (getf properties :correlation-id)
-     :payload body
-     :headers (getf properties :headers)
-     :delivery-tag (getf args :delivery-tag)
-     :redelivered-p (getf args :redelivered)
-     :exchange (getf args :exchange)
-     :topic (getf args :routing-key))))
+    (make-instance 'amqp-delivery
+                   :key (getf properties :correlation-id)
+                   :payload body
+                   :headers (getf properties :headers)
+                   :delivery-tag (getf args :delivery-tag)
+                   :redelivered-p (getf args :redelivered)
+                   :exchange (getf args :exchange)
+                   :topic (getf args :routing-key)
+                   :consumer-tag (getf args :consumer-tag)
+                   :queue queue)))
 
 (defun %unexpected-frame (conn text)
   "A frame that no request is waiting for: AMQP 0-9-1 connection exception
@@ -241,12 +312,18 @@ or after an unexpected frame)."
 (defun amqp-rpc (connection name replies &rest arguments)
   "Send method NAME (ARGUMENTS: its fields, plus :CHANNEL) and wait for one
 of the method names REPLIES. A broker Close in between is signalled
-(AMQP-CHANNEL-CLOSED / AMQP-CONNECTION-CLOSED). → the reply AMQP-METHOD."
-  (bt2:with-recursive-lock-held ((%connection-lock connection))
-    (%check-open connection)
-    (%with-transport-errors ((%endpoint connection))
-                            (apply #'write-amqp-method connection name arguments))
-    (values (%await connection replies))))
+(AMQP-CHANNEL-CLOSED / AMQP-CONNECTION-CLOSED). Broker notifications read
+on the way (AMQP-CONSUMER-CANCELLED) are signalled after the reply, unless
+AMQP-RPC runs inside a backend operation, which signals them when it is
+done. A non-local exit before the reply is read drops the connection
+(%WITH-REPLY-GUARD). → the reply AMQP-METHOD."
+  (%with-notifications (connection)
+                       (bt2:with-recursive-lock-held ((%connection-lock connection))
+                         (%check-open connection)
+                         (%with-reply-guard (connection)
+                                            (%with-transport-errors ((%endpoint connection))
+                                                                    (apply #'write-amqp-method connection name arguments))
+                                            (values (%await connection replies))))))
 
 (defun %ensure-channel (conn)
   "Reopen the default channel after the broker closed it."
@@ -327,12 +404,13 @@ answer a bad login with Connection.Close 403 instead of dropping the socket.")
 ;;; --- amqp:// URLs ----------------------------------------------------------
 
 (defun %redact-url (url)
-  "URL with the password in its userinfo replaced by ***, for error
-reports: URLs come from configuration and reports end up in logs."
+  "URL with any password in its userinfo replaced by ***, for error
+reports: URLs come from configuration and reports end up in logs. The
+userinfo is taken to end at the LAST @, not at the first / ? or #, so a
+password that holds one of those unescaped (base64 passwords hold /) is
+masked too. This can over-mask a malformed URL, never under-mask it."
   (let* ((start (let ((p (search "://" url))) (if p (+ p 3) 0)))
-         (end (or (position-if (lambda (c) (find c "/?#")) url :start start)
-                  (length url)))
-         (at (position #\@ url :start start :end end :from-end t))
+         (at (position #\@ url :start start :from-end t))
          (colon (and at (position #\: url :start start :end at))))
     (if colon
         (concatenate 'string (subseq url 0 (1+ colon)) "***" (subseq url at))
@@ -341,34 +419,47 @@ reports: URLs come from configuration and reports end up in logs."
 (defun parse-amqp-url (url)
   "Parse amqp://[user[:password]@]host[:port][/vhost] (amqps:// for TLS), the
 RabbitMQ URI spec: the vhost is the percent-decoded path after its first
-\"/\" (\"%2f\" is \"/\"); no path means the default vhost \"/\".
-→ plist :host :port :user :password :vhost :tls. Errors print the URL with
-the password masked (amqp://user:***@host)."
-  (let* ((shown (%redact-url url))
-         (uri (handler-case (quri:uri url)
-                (error ()
-                  (error 'mq-protocol:mq-error
-                         :message (format nil "malformed URL: ~a" shown)))))
-         (scheme (and (quri:uri-scheme uri) (string-downcase (quri:uri-scheme uri)))))
-    (unless (member scheme '("amqp" "amqps") :test #'equal)
-      (error 'mq-protocol:mq-error :message (format nil "not an amqp:// or amqps:// URL: ~a" shown)))
-    (unless (plusp (length (or (quri:uri-host uri) "")))
-      (error 'mq-protocol:mq-error :message (format nil "no host in ~a" shown)))
-    (let* ((tls (string= scheme "amqps"))
-           (userinfo (quri:uri-userinfo uri))
-           (colon (and userinfo (position #\: userinfo)))
-           (path (quri:uri-path uri)))
-      (append
-       (list :host (quri:uri-host uri)
-             :port (or (quri:uri-port uri) (if tls 5671 5672))
-             :tls tls
-             :vhost (if (or (null path) (string= path ""))
-                        "/"
-                        (quri:url-decode (subseq path 1))))
-       (when userinfo
-         (list :user (quri:url-decode (subseq userinfo 0 (or colon (length userinfo))))))
-       (when colon
-         (list :password (quri:url-decode (subseq userinfo (1+ colon)))))))))
+\"/\" (\"%2f\" is \"/\"); no path means the default vhost \"/\". User and
+password are percent-decoded, so / ? # @ and % in them must be escaped.
+→ plist :host :port :user :password :vhost :tls. Errors are MQ-ERRORs that
+print the URL with the password masked (amqp://user:***@host)."
+  (let ((shown (%redact-url url)))
+    (flet ((refuse (what)
+             (error 'mq-protocol:mq-error
+                    :message (format nil "~A: ~A~:[~; (escape % / ? # @ in the user or ~
+                                          password as %25 %2F %3F %23 %40)~]"
+                                     what shown (find #\@ url)))))
+      (let* ((uri (handler-case (quri:uri url)
+                    (error () (refuse "malformed URL"))))
+             (scheme (and (quri:uri-scheme uri) (string-downcase (quri:uri-scheme uri)))))
+        (unless (member scheme '("amqp" "amqps") :test #'equal)
+          (refuse "not an amqp:// or amqps:// URL"))
+        (unless (plusp (length (or (quri:uri-host uri) "")))
+          (refuse "no host in URL"))
+        ;; An unescaped / ? or # in the password ends quri's authority
+        ;; early and puts the @host in the path, query or fragment: refuse
+        ;; it rather than connect to the wrong host.
+        (when (some (lambda (part) (find #\@ (or part "")))
+                    (list (quri:uri-path uri) (quri:uri-query uri) (quri:uri-fragment uri)))
+          (refuse "malformed URL"))
+        (flet ((decode (text)
+                 (handler-case (quri:url-decode text)
+                   (error () (refuse "bad percent-escape in URL")))))
+          (let* ((tls (string= scheme "amqps"))
+                 (userinfo (quri:uri-userinfo uri))
+                 (colon (and userinfo (position #\: userinfo)))
+                 (path (quri:uri-path uri)))
+            (append
+             (list :host (quri:uri-host uri)
+                   :port (or (quri:uri-port uri) (if tls 5671 5672))
+                   :tls tls
+                   :vhost (if (or (null path) (string= path ""))
+                              "/"
+                              (decode (subseq path 1))))
+             (when userinfo
+               (list :user (decode (subseq userinfo 0 (or colon (length userinfo))))))
+             (when colon
+               (list :password (decode (subseq userinfo (1+ colon))))))))))))
 
 ;;; --- open / close ----------------------------------------------------------
 
