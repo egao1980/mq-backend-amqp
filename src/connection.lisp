@@ -46,6 +46,23 @@
       (prog1 (subseq buf pos (+ pos n))
         (incf (octet-pipe-read-pos source) n)))))
 
+(defstruct (%channel-state (:constructor %make-channel-state (&key open-p))
+                           (:conc-name %cs-))
+  "What the client knows of one channel of a connection. Delivery tags are
+per channel, and a reopened channel numbers its deliveries from 1 again: the
+tags handed out are the wire tag plus OFFSET, the highest tag handed out
+before the channel last closed, so a tag at or below OFFSET belongs to a
+closed channel and is never sent (AMQP-STALE-DELIVERY). UNSETTLED holds
+the tags (offset included) the broker still waits to have acked; MAX-TAG
+is the highest one handed out. CLOSE is a broker Channel.Close read while
+another channel's reply was awaited, as (reply-code reply-text class-id
+method-id), until an operation on this channel reports it."
+  (open-p nil)
+  (offset 0 :type integer)
+  (max-tag 0 :type integer)
+  (unsettled (make-hash-table) :read-only t)
+  (close nil))
+
 (defclass amqp-connection ()
   ((stream :initarg :stream :accessor amqp-connection-stream)
    (channel :initarg :channel :accessor amqp-connection-channel :initform 1)
@@ -61,7 +78,9 @@
            :documentation "The usocket socket when the connection owns one.")
    (host :initarg :host :initform nil :reader amqp-connection-host)
    (port :initarg :port :initform nil :reader amqp-connection-port)
-   (channel-open-p :initform t :accessor %channel-open-p)
+   (channels :initform (make-hash-table) :reader %channels
+             :documentation "Channel number → %CHANNEL-STATE. The default channel
+starts open.")
    (closed-p :initform nil :accessor amqp-connection-closed-p)
    (blocked :initform nil :accessor amqp-connection-blocked
             :documentation "The broker's Connection.Blocked reason while it holds publishers.")
@@ -75,23 +94,15 @@ sends active=true again.")
             :documentation "Delivered messages not handed out yet, oldest first:
 Basic.Deliver frames that arrived while waiting for a reply, and messages a
 POLL-MESSAGES fetched but could not hand out. Each is handed out by a poll
-of its own queue (%DELIVERY-QUEUE).")
+of its own queue and channel (%DELIVERY-QUEUE).")
+   (handing-out :initform '() :accessor %handing-out
+                :documentation "Messages a POLL-MESSAGES fetched and has not returned
+yet (it signals broker notifications first): not handed out either.")
    (consumer-queues :initform '() :accessor %consumer-queues
                     :documentation "(consumer-tag . queue) for each SUBSCRIBE on this connection.")
    (no-ack-consumers :initform '() :accessor %no-ack-consumers
                      :documentation "Consumer tags SUBSCRIBEd with no-ack: their
 deliveries are settled on arrival and cannot be acked.")
-   (tag-offset :initform 0 :accessor %tag-offset
-               :documentation "Delivery tags are per channel, and a reopened channel
-numbers its deliveries from 1 again. The tags this connection hands out are
-the wire tag plus this offset: the highest tag handed out before the channel
-last closed. A tag at or below it belongs to a closed channel and is never
-sent (AMQP-STALE-DELIVERY).")
-   (max-tag :initform 0 :accessor %max-tag
-            :documentation "The highest delivery tag (offset included) handed out.")
-   (settled-through :initform 0 :accessor %settled-through
-                    :documentation "The highest tag (offset included) a multiple ack or
-nack settled: every delivery up to it is settled.")
    (notifications :initform '() :accessor %pending-notifications
                   :documentation "Broker notifications to signal, oldest first, as
 (condition-type . initargs): see %SIGNAL-NOTIFICATIONS.")
@@ -106,6 +117,18 @@ OPEN-AMQP-CONNECTION makes one that owns its socket, after the handshake."))
                  :channel channel
                  :frame-max frame-max))
 
+(defmethod initialize-instance :after ((conn amqp-connection) &key)
+  (setf (gethash (amqp-connection-channel conn) (%channels conn))
+        (%make-channel-state :open-p t)))
+
+(defun %channel-state (conn &optional (channel (amqp-connection-channel conn)))
+  "CONN's %CHANNEL-STATE for CHANNEL (made on first use, closed)."
+  (or (gethash channel (%channels conn))
+      (setf (gethash channel (%channels conn)) (%make-channel-state))))
+
+(defun %channel-open-p (conn &optional (channel (amqp-connection-channel conn)))
+  (%cs-open-p (%channel-state conn channel)))
+
 (defun write-amqp-frame (connection frame-or-octets)
   (let ((octets (if (amqp-frame-p frame-or-octets)
                     (encode-frame (amqp-frame-type frame-or-octets)
@@ -117,11 +140,21 @@ OPEN-AMQP-CONNECTION makes one that owns its socket, after the handshake."))
     octets))
 
 (defun read-amqp-frame (connection)
+  "The next frame. One larger than the connection's frame-max (the client's
+before Tune, the negotiated one after; 0: no limit) is an AMQP-FRAME-ERROR
+before its payload is read: no peer may send one, and a non-AMQP peer (an
+HTTP port) would otherwise make it allocate whatever its first octets say."
   (let* ((header (read-amqp-octets (amqp-connection-stream connection) 7))
          (size (first (binary-protocol:unpack "!I" header :start 3)))
-         (rest (read-amqp-octets (amqp-connection-stream connection) (1+ size)))
-         (octets (concatenate '(simple-array (unsigned-byte 8) (*)) header rest)))
-    (decode-frame octets)))
+         (frame-max (amqp-connection-frame-max connection)))
+    (when (and (plusp frame-max) (> (+ size 8) frame-max))
+      (error 'amqp-frame-error
+             :offset 3
+             :message (format nil "a frame of ~D octets is over the frame-max ~D (not an AMQP 0-9-1 peer?)"
+                              (+ size 8) frame-max)))
+    (let* ((rest (read-amqp-octets (amqp-connection-stream connection) (1+ size)))
+           (octets (concatenate '(simple-array (unsigned-byte 8) (*)) header rest)))
+      (decode-frame octets))))
 
 (defun write-amqp-method (connection name &rest arguments)
   (let* ((channel (or (getf arguments :channel)
