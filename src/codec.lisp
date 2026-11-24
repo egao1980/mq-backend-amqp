@@ -91,18 +91,18 @@ RATIO has none."
                       (values scale unscaled))))
 
 (defun string-octets (string)
+  "The octets of an AMQP short or long string: a string in UTF-8 (AMQP 0-9-1
+strings are UTF-8, so a queue named café goes out as 63 61 66 C3 A9, as pika
+sends it), or octets as they are."
   (cond
     ((null string)
      (make-array 0 :element-type '(unsigned-byte 8)))
     ((stringp string)
-     (map '(simple-array (unsigned-byte 8) (*))
-          (lambda (ch)
-            (let ((c (char-code ch)))
-              (unless (<= 0 c 255)
-                (error 'amqp-frame-error
-                       :message (format nil "non-latin-1 char in ~s" string)))
-              c))
-          string))
+     (handler-case (coerce (encoding-protocol:encode string :encoding :utf-8)
+                           '(simple-array (unsigned-byte 8) (*)))
+       (encoding-protocol:encoding-error (e)
+         (error 'amqp-frame-error
+                :message (format nil "~S is not encodable as UTF-8: ~A" string e)))))
     ((and (vectorp string)
           (every (lambda (b) (typep b '(unsigned-byte 8))) string))
      (coerce string '(simple-array (unsigned-byte 8) (*))))
@@ -111,7 +111,13 @@ RATIO has none."
             :message (format nil "expected string/octets, got ~s" string)))))
 
 (defun octets-string (octets)
-  (map 'string #'code-char octets))
+  "An AMQP short or long string read as UTF-8. Octets that are not UTF-8 (a
+long string can carry anything) are read one character per octet instead,
+which loses nothing, rather than failing the whole frame."
+  (handler-case (encoding-protocol:decode (coerce octets '(simple-array (unsigned-byte 8) (*)))
+                                          :encoding :utf-8 :strict t)
+    (encoding-protocol:encoding-error ()
+      (map 'string #'code-char octets))))
 
 (defun encode-shortstr (buf value)
   (let ((octets (string-octets (or value ""))))

@@ -78,20 +78,23 @@ connection (Connection.Close, socket released) however BODY exits."
   (and (%connection-socket conn) t))
 
 (defmacro %with-backend-connection ((conn backend) &body body)
-  "Run BODY with CONN, under its lock, after a heartbeat tick and, on a live
-connection, with the channel (re)opened. A closed connection signals
-MQ-CONNECTION-ERROR. This is one backend operation: broker notifications
-read during it are signalled when it (or the outermost one) is done, with
-the lock released (%WITH-NOTIFICATIONS)."
+  "Run BODY with CONN, under its lock. On a live connection, first read what
+the broker already sent (%DRAIN-INCOMING: a broker Close of the backend's
+channel is signalled now, before more requests go to it), tick the
+heartbeat and make the backend's channel usable (%ENSURE-CHANNEL). A
+closed connection signals MQ-CONNECTION-ERROR. This is one backend
+operation: broker notifications read during it are signalled when it (or
+the outermost one) is done, with the lock released (%WITH-NOTIFICATIONS)."
   `(let ((,conn (%conn ,backend)))
      (%with-notifications (,conn)
-                          (bt2:with-recursive-lock-held ((%connection-lock ,conn))
-                            (%check-open ,conn)
-                            (when (%live-p ,conn)
-                              (amqp-heartbeat-tick ,conn)
-                              (%ensure-channel ,conn))
-                            (%with-transport-errors ((%endpoint ,conn))
-                                                    ,@body)))))
+       (bt2:with-recursive-lock-held ((%connection-lock ,conn))
+         (%check-open ,conn)
+         (when (%live-p ,conn)
+           (%drain-incoming ,conn (amqp-backend-channel ,backend))
+           (amqp-heartbeat-tick ,conn)
+           (%ensure-channel ,conn (amqp-backend-channel ,backend)))
+         (%with-transport-errors ((%endpoint ,conn))
+           ,@body)))))
 
 (defun %body-frames (conn payload channel)
   "PAYLOAD split into body frames that fit the negotiated frame-max."
@@ -105,50 +108,72 @@ the lock released (%WITH-NOTIFICATIONS)."
                        :channel channel)))))
 
 (defmethod mq-protocol:publish ((backend amqp-backend) destination message &key)
+  "Basic.Publish of MESSAGE (or a payload) to DESTINATION: a queue name on
+the default exchange, or (exchange . routing-key). Every frame is encoded
+before any is written, so a message the encoder refuses (a key over 255
+octets, a header with no field-table type) signals AMQP-FRAME-ERROR with
+nothing sent, as pika does. A write cut short drops the connection: half a
+publish on the wire would make the broker read the next request as its
+content. A broker Close that came in before is signalled first (see
+%WITH-BACKEND-CONNECTION), so a publish to a channel the broker closed
+fails instead of being discarded. → the MQ-MESSAGE."
   (let* ((msg (if (mq-protocol:mq-message-p message)
                   message
                   (mq-protocol:make-mq-message :payload message)))
          (payload (mq-protocol:mq-message-payload msg))
-         (channel (amqp-backend-channel backend)))
+         (channel (amqp-backend-channel backend))
+         (frames (multiple-value-bind (exchange routing-key)
+                     (%destination-pair destination msg)
+                   (list* (encode-method-frame :basic-publish
+                                               :channel channel
+                                               :exchange (or exchange "")
+                                               :routing-key (or routing-key "")
+                                               :mandatory nil
+                                               :immediate nil)
+                          (encode-content-header
+                           :class-id 60
+                           :body-size (length payload)
+                           :channel channel
+                           :properties (append
+                                        (and (mq-protocol:mq-message-headers msg)
+                                             (list :headers (mq-protocol:mq-message-headers msg)))
+                                        (and (mq-protocol:mq-message-key msg)
+                                             (list :correlation-id
+                                                   (princ-to-string (mq-protocol:mq-message-key msg))))))
+                          (%body-frames (%conn backend) payload channel)))))
     (%with-backend-connection (conn backend)
-                              (multiple-value-bind (exchange routing-key)
-                                  (%destination-pair destination msg)
-                                (write-amqp-method conn :basic-publish
-                                                   :channel channel
-                                                   :exchange (or exchange "")
-                                                   :routing-key (or routing-key "")
-                                                   :mandatory nil
-                                                   :immediate nil)
-                                (write-amqp-frame
-                                 conn
-                                 (encode-content-header
-                                  :class-id 60
-                                  :body-size (length payload)
-                                  :channel channel
-                                  :properties (append
-                                               (and (mq-protocol:mq-message-headers msg)
-                                                    (list :headers (mq-protocol:mq-message-headers msg)))
-                                               (and (mq-protocol:mq-message-key msg)
-                                                    (list :correlation-id
-                                                          (princ-to-string (mq-protocol:mq-message-key msg)))))))
-                                (dolist (frame (%body-frames conn payload channel))
-                                  (write-amqp-frame conn frame))))
+      (%with-reply-guard (conn)
+        (dolist (frame frames)
+          (write-amqp-frame conn frame))))
     msg))
 
 (defmethod mq-protocol:subscribe ((backend amqp-backend) destination handler &key
-                                  (consumer-tag "") no-ack no-wait)
+                                  (consumer-tag "") no-ack no-wait prefetch)
   "Basic.Consume on queue DESTINATION. On a live connection the broker's
 Consume-Ok is awaited (unless NO-WAIT) and its consumer tag kept; with
-NO-WAIT and no CONSUMER-TAG the client picks the tag (cl-stack.ctag.N), so
-every consumer's queue is known. Messages delivered to it are handed out by
-POLL-MESSAGES of DESTINATION. With NO-ACK they are settled on arrival, and
-ACK / NACK of one signals AMQP-STALE-DELIVERY."
+NO-WAIT and no CONSUMER-TAG the client picks the tag (cl-stack.ctag.N, never
+reused on the connection), so every consumer's queue is known. Consumer
+tags are channel-local: the consumer is recorded on the backend's channel,
+until the broker cancels it or the channel closes. Messages delivered to it
+are handed out by POLL-MESSAGES of DESTINATION on that channel. With NO-ACK
+they are settled on arrival, and ACK / NACK of one signals
+AMQP-STALE-DELIVERY. PREFETCH (a count) sends Basic.Qos first: the broker
+then has at most that many unacked deliveries out on the channel, which
+bounds what a consumer of a busy queue holds (without it, RabbitMQ pushes
+everything)."
   (let ((tag consumer-tag)
-        (queue (%dest-string destination)))
+        (queue (%dest-string destination))
+        (channel (amqp-backend-channel backend)))
     (%with-backend-connection (conn backend)
+      (when prefetch
+        (check-type prefetch (integer 0 65535))
+        (let ((qos (list :channel channel :prefetch-size 0 :prefetch-count prefetch :global nil)))
+          (if (%live-p conn)
+              (apply #'amqp-rpc conn :basic-qos '(:basic-qos-ok) qos)
+              (apply #'write-amqp-method conn :basic-qos qos))))
       (when (and no-wait (or (null tag) (string= tag "")))
-        (setf tag (format nil "cl-stack.ctag.~D" (1+ (length (%consumer-queues conn))))))
-      (let ((args (list :channel (amqp-backend-channel backend)
+        (setf tag (format nil "cl-stack.ctag.~D" (incf (%consumer-count conn)))))
+      (let ((args (list :channel channel
                         :queue queue
                         :consumer-tag (or tag "")
                         :no-local nil
@@ -161,9 +186,10 @@ ACK / NACK of one signals AMQP-STALE-DELIVERY."
                             :consumer-tag))
             (apply #'write-amqp-method conn :basic-consume args))
         (when (and tag (string/= tag ""))
-          (push (cons tag queue) (%consumer-queues conn))
+          (%forget-consumer conn channel tag)
+          (push (cons tag queue) (%consumer-queues conn channel))
           (when no-ack
-            (push tag (%no-ack-consumers conn))))))
+            (push tag (%no-ack-consumers conn channel))))))
     (make-instance 'mq-protocol:mq-subscription
                    :destination destination
                    :handler handler
@@ -203,86 +229,154 @@ the broker name it. → (values queue-name message-count consumer-count)."
   queue)
 
 (defun %basic-get (backend conn queue)
-  "One Basic.Get. → an AMQP-DELIVERY, or NIL when the queue is empty. The
-Get-Ok and its content frames are one reply (%WITH-REPLY-GUARD)."
-  (%with-reply-guard (conn)
-    (let ((reply (amqp-rpc conn :basic-get '(:basic-get-ok :basic-get-empty)
-                                :channel (amqp-backend-channel backend)
-                                :reserved-1 0 :queue queue :no-ack nil)))
-      (when (eq :basic-get-ok (amqp-method-name reply))
-        (multiple-value-bind (properties body) (%read-content conn)
-          (%delivery-message conn reply properties body :queue queue))))))
-
-(defun %retired-p (conn message)
-  "Was MESSAGE delivered on a channel of CONN that has closed since? The
-broker requeued it then, so it must not be handed out (or acked) now."
-  (let ((tag (mq-protocol:mq-message-delivery-tag message)))
-    (and (integerp tag) (<= tag (%tag-offset conn)))))
+  "One Basic.Get on BACKEND's channel. → an AMQP-DELIVERY, or NIL when the
+queue is empty. The Get-Ok and its content frames are one reply
+(%WITH-REPLY-GUARD)."
+  (let ((channel (amqp-backend-channel backend)))
+    (%with-reply-guard (conn)
+      (let ((reply (amqp-rpc conn :basic-get '(:basic-get-ok :basic-get-empty)
+                                  :channel channel
+                                  :reserved-1 0 :queue queue :no-ack nil)))
+        (when (eq :basic-get-ok (amqp-method-name reply))
+          (multiple-value-bind (properties body) (%read-content conn)
+            (%delivery-message conn channel reply properties body :queue queue)))))))
 
 (defun %given-tag (message)
   (if (integerp message) message (mq-protocol:mq-message-delivery-tag message)))
 
-(defun %outstanding-tag (conn message multiple)
-  "The wire delivery tag that acks or nacks MESSAGE on CONN's open channel.
-MESSAGE is an AMQP-DELIVERY, another MQ-MESSAGE that carries the tag of
-one (a copy), or an integer tag that CONN handed out; 0 with MULTIPLE is
-every delivery outstanding on the channel. → (values tag NIL), or (values
-NIL reason) when it is not outstanding there (see AMQP-STALE-DELIVERY).
-The caller holds the connection lock."
-  (let ((tag (%given-tag message))
-        (settled (and (typep message 'amqp-delivery) (%delivery-settled message))))
-    (cond
-     ((and (typep message 'amqp-delivery)
-           (not (eq conn (%delivery-connection message))))
-      (values nil :other-connection))
-     ((eq settled :no-ack) (values nil :no-ack))
-     (settled (values nil :settled))
-     ((and (eql tag 0) multiple)
-      (values 0 nil))
-     ((not (and (integerp tag) (plusp tag)))
-      (error 'mq-protocol:mq-error
-             :message (format nil "~S has no delivery tag to ack or nack" message)))
-     ((<= tag (%tag-offset conn)) (values nil :channel-closed))
-     ((<= tag (%settled-through conn)) (values nil :settled))
-     (t (values (- tag (%tag-offset conn)) nil)))))
+(defun %highest-unsettled (unsettled limit)
+  "The highest tag in the UNSETTLED set at or below LIMIT (NIL: any). NIL
+when there is none."
+  (let ((top nil))
+    (maphash (lambda (tag v)
+               (declare (ignore v))
+               (when (and (or (null limit) (<= tag limit))
+                          (or (null top) (> tag top)))
+                 (setf top tag)))
+             unsettled)
+    top))
 
-(defun %check-multiple (conn tag)
-  "A multiple ack or nack of TAG (0: all) settles every delivery up to it
-on the channel, those not handed out yet included. Refuse it while one of
-those is pending: it would be acked before anyone saw it."
+(defun %outstanding-tag (conn channel message multiple)
+  "What acks or nacks MESSAGE on CONN's CHANNEL. MESSAGE is an
+AMQP-DELIVERY, another MQ-MESSAGE that carries the tag of one (a copy), or
+an integer tag that CONN handed out (tag 0 with MULTIPLE is %SETTLE's, see
+%EVERY-HANDED-OUT). → (values wire-tag tag NIL), TAG being the highest
+delivery it settles (offset included), or (values NIL NIL reason) when
+MESSAGE is not outstanding on CHANNEL (see AMQP-STALE-DELIVERY).
+A multiple ack settles every unsettled delivery up to its tag; it is sent
+with the highest of them, never with a tag already settled (the broker
+would close the channel). A tag above every tag handed out is sent as
+given (deliveries read by other means). The caller holds the connection
+lock."
+  (let* ((state (%channel-state conn channel))
+         (offset (%cs-offset state))
+         (unsettled (%cs-unsettled state))
+         (tag (%given-tag message))
+         (delivery (and (typep message 'amqp-delivery) message))
+         (settled (and delivery (%delivery-settled delivery))))
+    (cond
+      ((and delivery (not (eq conn (%delivery-connection delivery))))
+       (values nil nil :other-connection))
+      ((and delivery (not (eql channel (%delivery-channel delivery))))
+       (values nil nil :other-channel))
+      ((eq settled :no-ack) (values nil nil :no-ack))
+      (settled (values nil nil :settled))
+      ((not (and (integerp tag) (plusp tag)))
+       (error 'mq-protocol:mq-error
+              :message (format nil "~S has no delivery tag to ack or nack" message)))
+      ((<= tag offset) (values nil nil :channel-closed))
+      ((> tag (%cs-max-tag state)) (values (- tag offset) tag nil))
+      (multiple
+       (let ((top (%highest-unsettled unsettled tag)))
+         (if top
+             (values (- top offset) top nil)
+             (values nil nil :settled))))
+      ((gethash tag unsettled) (values (- tag offset) tag nil))
+      (t (values nil nil :settled)))))
+
+(defun %check-multiple (conn channel tag)
+  "A multiple ack or nack up to TAG settles every delivery up to it on
+CHANNEL, those read but not handed out yet included: kept for a poll, or
+fetched by a poll that has not returned them yet. Refuse it while there is
+one: it would be acked before anyone saw it."
   (let ((unseen (count-if (lambda (m)
-                            (or (zerop tag)
-                                (<= (mq-protocol:mq-message-delivery-tag m) tag)))
-                          (%pending-deliveries conn))))
+                            (and (eql channel (%delivery-channel m))
+                                 (<= (mq-protocol:mq-message-delivery-tag m) tag)))
+                          (append (%pending-deliveries conn) (%handing-out conn)))))
     (when (plusp unseen)
       (error 'mq-protocol:mq-error
-             :message (format nil "a multiple ack / nack ~:[up to delivery ~d~;of every delivery~*~] ~
-                                   would settle ~d delivered message~:p not handed out yet; ~
-                                   poll them first or ack one by one"
-                              (zerop tag) tag unseen)))))
+             :message (format nil "a multiple ack / nack up to delivery ~D would settle ~D ~
+                                   delivered message~:P not handed out yet; poll them first ~
+                                   or ack one by one"
+                              tag unseen)))))
+
+(defun %every-handed-out (conn channel)
+  "What an ack or nack of every delivery (tag 0, multiple) settles on CONN's
+CHANNEL: the deliveries handed out that the broker still waits for, and no
+other. → (values through singles): THROUGH, the highest of them below every
+delivery read but not handed out yet (kept for a poll, or fetched by a poll
+that has not returned), is settled with one multiple ack; SINGLES, those
+above such a delivery, one by one, so it is not covered. Both NIL when there
+is nothing to settle. Deliveries still in the socket have higher tags than
+any read, so they are never covered either."
+  (let* ((unseen (loop for m in (append (%pending-deliveries conn) (%handing-out conn))
+                       when (eql channel (%delivery-channel m))
+                         collect (mq-protocol:mq-message-delivery-tag m)))
+         (lowest-unseen (and unseen (reduce #'min unseen)))
+         (through nil)
+         (singles '()))
+    (maphash (lambda (tag v)
+               (declare (ignore v))
+               (cond
+                 ((member tag unseen))
+                 ((or (null lowest-unseen) (< tag lowest-unseen))
+                  (when (or (null through) (> tag through))
+                    (setf through tag)))
+                 (t (push tag singles))))
+             (%cs-unsettled (%channel-state conn channel)))
+    (values through (sort singles #'<))))
 
 (defun %settle (backend message method &rest fields &key multiple &allow-other-keys)
   "Send METHOD (:BASIC-ACK or :BASIC-NACK) with FIELDS for MESSAGE on
-BACKEND's channel. When MESSAGE is not outstanding there nothing is sent
-and AMQP-STALE-DELIVERY is signalled, outside the connection lock, with
-restart CONTINUE (send nothing, → NIL). → MESSAGE."
-  (let ((reason nil))
+BACKEND's channel (%OUTSTANDING-TAG), and mark what it settles. Tag 0 with
+MULTIPLE is every delivery handed out (%EVERY-HANDED-OUT), never one not
+handed out yet. When MESSAGE is not outstanding there nothing is sent and
+AMQP-STALE-DELIVERY is signalled, outside the connection lock, with restart
+CONTINUE (send nothing, → NIL). → MESSAGE."
+  (let ((reason nil)
+        (channel (amqp-backend-channel backend)))
     (%with-backend-connection (conn backend)
-      (multiple-value-bind (wire why) (%outstanding-tag conn message multiple)
-        (if why
-            (setf reason why)
-            (let ((through (if (zerop wire) (%max-tag conn) (%given-tag message))))
-              (when multiple
-                (%check-multiple conn (if (zerop wire) 0 through)))
-              (apply #'write-amqp-method conn method
-                     :channel (amqp-backend-channel backend)
-                     :delivery-tag wire fields)
-              (when (typep message 'amqp-delivery)
-                (setf (%delivery-settled message)
-                      (if (eq method :basic-ack) :ack :nack)))
-              (when multiple
-                (setf (%settled-through conn)
-                      (max (%settled-through conn) through)))))))
+      (let* ((state (%channel-state conn channel))
+             (unsettled (%cs-unsettled state))
+             (offset (%cs-offset state)))
+        (flet ((send (tag &key (multiple multiple))
+                 ;; The first :MULTIPLE in the plist is the one encoded.
+                 (apply #'write-amqp-method conn method
+                        :channel channel :delivery-tag (- tag offset) :multiple multiple
+                        fields)
+                 (if multiple
+                     (dolist (done (loop for k being the hash-keys of unsettled
+                                         when (<= k tag) collect k))
+                       (remhash done unsettled))
+                     (remhash tag unsettled))))
+          (if (and multiple (eql 0 (%given-tag message)))
+              (multiple-value-bind (through singles) (%every-handed-out conn channel)
+                (if (or through singles)
+                    (progn
+                      (when through (send through))
+                      (dolist (tag singles) (send tag :multiple nil)))
+                    (setf reason :settled)))
+              (multiple-value-bind (wire tag why) (%outstanding-tag conn channel message multiple)
+                (declare (ignore wire))
+                (cond
+                  (why (setf reason why))
+                  (t
+                   (when multiple
+                     (%check-multiple conn channel tag))
+                   (send tag)
+                   (when (typep message 'amqp-delivery)
+                     (setf (%delivery-settled message)
+                           (if (eq method :basic-ack) :ack :nack))))))))))
     (if reason
         (restart-case (error 'amqp-stale-delivery :backend backend
                                                   :delivery-tag (%given-tag message)
@@ -292,16 +386,17 @@ restart CONTINUE (send nothing, → NIL). → MESSAGE."
             nil))
         message)))
 
-(defun %take-pending (conn queue n)
-  "Remove and return up to N delivered messages of QUEUE from CONN's
-pending list, oldest first. Messages of other queues stay; messages whose
-channel closed since are dropped (the broker requeued them). The caller
-holds the connection lock."
+(defun %take-pending (conn queue n &optional (channel (amqp-connection-channel conn)))
+  "Remove and return up to N delivered messages of QUEUE on CHANNEL from
+CONN's pending list, oldest first. Messages of other queues or channels
+stay; messages whose channel closed since are dropped (the broker requeued
+them). The caller holds the connection lock."
   (let ((taken '()) (kept '()))
     (dolist (msg (%pending-deliveries conn))
       (cond
        ((%retired-p conn msg))
        ((and (< (length taken) n)
+             (eql channel (%delivery-channel msg))
              (equal queue (%delivery-queue conn msg)))
         (push msg taken))
        (t (push msg kept))))
@@ -321,48 +416,59 @@ whose channel closed meanwhile are dropped: the broker requeued them."
 (defmethod mq-protocol:poll-messages ((backend amqp-backend) destination
                                       &key (n 1) timeout)
   "Up to N messages from queue DESTINATION (acknowledge them with ACK /
-NACK). Messages already delivered to this connection for DESTINATION (to a
-consumer on it, see SUBSCRIBE) come first, then Basic.Get. Messages of
-other queues stay for polls of those queues. With TIMEOUT (seconds) an
-empty queue is retried until a message arrives or the time is up; without
-it one attempt is made. Broker notifications read meanwhile are signalled
-before the messages are returned; if a handler unwinds, the messages are
-kept for the next poll of DESTINATION, not lost."
+NACK). Messages already delivered to this connection for DESTINATION on
+the backend's channel (to a consumer on it, see SUBSCRIBE) come first,
+then Basic.Get. Messages of other queues stay for polls of those queues.
+With TIMEOUT (seconds) an empty queue is retried until a message arrives or
+the time is up; without it one attempt is made. Broker notifications read
+meanwhile are signalled before the messages are returned. Until they are
+returned the messages are not handed out: from the moment they are taken
+(under the connection lock) a multiple ack on any thread does not cover
+them, and if a handler unwinds, or the poll fails half way, they are kept
+for the next poll of DESTINATION, not lost."
   (check-type n (integer 1))
   (let* ((queue (%dest-string destination))
+         (channel (amqp-backend-channel backend))
          (conn (%conn backend))
          (deadline (and timeout
                         (+ (get-internal-real-time)
                            (round (* timeout internal-time-units-per-second)))))
          (out '())
          (handed-out nil))
-    (let ((*amqp-operation-depth* (1+ *amqp-operation-depth*)))
-      (loop
-        (%with-backend-connection (conn backend)
-                                  (unless (%live-p conn)
-                                    (error 'mq-protocol:mq-error
-                                           :backend backend
-                                           :message "poll-messages needs a broker: open the backend with :host or :url"))
-                                  (setf out (append out (%take-pending conn queue (- n (length out)))))
-                                  (loop while (< (length out) n)
-                                        do (let ((msg (%basic-get backend conn queue)))
-                                             (if msg
-                                                 (setf out (append out (list msg)))
-                                                 (return)))))
-        (when (or out
-                  (null deadline)
-                  (>= (get-internal-real-time) deadline))
-          (return))
-        (sleep (min 0.05 (/ (max 0 (- deadline (get-internal-real-time)))
-                            internal-time-units-per-second)))))
-    (unwind-protect
-        (progn
-          (when (zerop *amqp-operation-depth*)
-            (%signal-notifications conn))
-          (setf handed-out t)
-          out)
-      (unless handed-out
-        (%hold-back conn out)))))
+    (flet ((take (messages)
+             ;; Under the connection lock: in OUT and in %HANDING-OUT at once.
+             (setf out (append out messages)
+                   (%handing-out conn) (append messages (%handing-out conn)))))
+      (unwind-protect
+          (progn
+            (let ((*amqp-operation-depth* (1+ *amqp-operation-depth*)))
+              (loop
+                (%with-backend-connection (conn backend)
+                  (unless (%live-p conn)
+                    (error 'mq-protocol:mq-error
+                           :backend backend
+                           :message "poll-messages needs a broker: open the backend with :host or :url"))
+                  (take (%take-pending conn queue (- n (length out)) channel))
+                  (loop while (< (length out) n)
+                        do (let ((msg (%basic-get backend conn queue)))
+                             (if msg
+                                 (take (list msg))
+                                 (return)))))
+                (when (or out
+                          (null deadline)
+                          (>= (get-internal-real-time) deadline))
+                  (return))
+                (sleep (min 0.05 (/ (max 0 (- deadline (get-internal-real-time)))
+                                    internal-time-units-per-second)))))
+            (when (zerop *amqp-operation-depth*)
+              (%signal-notifications conn))
+            (setf handed-out t)
+            out)
+        (bt2:with-recursive-lock-held ((%connection-lock conn))
+          (setf (%handing-out conn)
+                (remove-if (lambda (m) (member m out)) (%handing-out conn))))
+        (unless handed-out
+          (%hold-back conn out))))))
 
 (defmethod mq-protocol:ack ((backend amqp-backend) message &key multiple)
   "Basic.Ack of MESSAGE (an AMQP-DELIVERY, a copy of one, or an integer tag

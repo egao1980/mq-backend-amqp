@@ -29,11 +29,13 @@
       (length octets))))
 
 (defgeneric read-amqp-octets (source n)
+  (:documentation "N octets from SOURCE. The end of a stream before them is an
+AMQP-TRANSPORT-ERROR (an MQ-CONNECTION-ERROR): the peer went away.")
   (:method ((source stream) n)
     (let ((buf (make-array n :element-type '(unsigned-byte 8) :initial-element 0)))
       (let ((got (read-sequence buf source)))
         (unless (= got n)
-          (error 'mq-protocol:mq-connection-error
+          (error 'amqp-transport-error
                  :message (format nil "unexpected EOF (got ~d of ~d)" got n)))
         buf)))
   (:method ((source octet-pipe) n)
@@ -45,6 +47,28 @@
                :message (format nil "pipe underrun (need ~d, have ~d)" n avail)))
       (prog1 (subseq buf pos (+ pos n))
         (incf (octet-pipe-read-pos source) n)))))
+
+(defstruct (%channel-state (:constructor %make-channel-state (&key open-p))
+                           (:conc-name %cs-))
+  "What the client knows of one channel of a connection. Delivery tags are
+per channel, and a reopened channel numbers its deliveries from 1 again: the
+tags handed out are the wire tag plus OFFSET, the highest tag handed out
+before the channel last closed, so a tag at or below OFFSET belongs to a
+closed channel and is never sent (AMQP-STALE-DELIVERY). UNSETTLED holds
+the tags (offset included) the broker still waits to have acked; MAX-TAG
+is the highest one handed out. CLOSE is a broker Channel.Close read while
+another channel's reply was awaited, as (reply-code reply-text class-id
+method-id), until an operation on this channel reports it. Consumer tags
+are channel-local too: CONSUMERS is (consumer-tag . queue) for each live
+consumer on the channel, NO-ACK the tags of those that are no-ack; a
+consumer leaves both when the broker cancels it or the channel closes."
+  (open-p nil)
+  (offset 0 :type integer)
+  (max-tag 0 :type integer)
+  (unsettled (make-hash-table) :read-only t)
+  (close nil)
+  (consumers '())
+  (no-ack '()))
 
 (defclass amqp-connection ()
   ((stream :initarg :stream :accessor amqp-connection-stream)
@@ -61,7 +85,9 @@
            :documentation "The usocket socket when the connection owns one.")
    (host :initarg :host :initform nil :reader amqp-connection-host)
    (port :initarg :port :initform nil :reader amqp-connection-port)
-   (channel-open-p :initform t :accessor %channel-open-p)
+   (channels :initform (make-hash-table) :reader %channels
+             :documentation "Channel number → %CHANNEL-STATE. The default channel
+starts open.")
    (closed-p :initform nil :accessor amqp-connection-closed-p)
    (blocked :initform nil :accessor amqp-connection-blocked
             :documentation "The broker's Connection.Blocked reason while it holds publishers.")
@@ -75,23 +101,15 @@ sends active=true again.")
             :documentation "Delivered messages not handed out yet, oldest first:
 Basic.Deliver frames that arrived while waiting for a reply, and messages a
 POLL-MESSAGES fetched but could not hand out. Each is handed out by a poll
-of its own queue (%DELIVERY-QUEUE).")
-   (consumer-queues :initform '() :accessor %consumer-queues
-                    :documentation "(consumer-tag . queue) for each SUBSCRIBE on this connection.")
-   (no-ack-consumers :initform '() :accessor %no-ack-consumers
-                     :documentation "Consumer tags SUBSCRIBEd with no-ack: their
-deliveries are settled on arrival and cannot be acked.")
-   (tag-offset :initform 0 :accessor %tag-offset
-               :documentation "Delivery tags are per channel, and a reopened channel
-numbers its deliveries from 1 again. The tags this connection hands out are
-the wire tag plus this offset: the highest tag handed out before the channel
-last closed. A tag at or below it belongs to a closed channel and is never
-sent (AMQP-STALE-DELIVERY).")
-   (max-tag :initform 0 :accessor %max-tag
-            :documentation "The highest delivery tag (offset included) handed out.")
-   (settled-through :initform 0 :accessor %settled-through
-                    :documentation "The highest tag (offset included) a multiple ack or
-nack settled: every delivery up to it is settled.")
+of its own queue and channel (%DELIVERY-QUEUE).")
+   (pending-end :initform nil :accessor %pending-end
+                :documentation "(head . last-cons) of the pending list when a delivery was
+last added, so the next one is added in constant time (%ENQUEUE-DELIVERY).")
+   (handing-out :initform '() :accessor %handing-out
+                :documentation "Messages a POLL-MESSAGES fetched and has not returned
+yet (it signals broker notifications first): not handed out either.")
+   (consumer-count :initform 0 :accessor %consumer-count
+                   :documentation "Client-picked consumer tags made so far (cl-stack.ctag.N), so none is reused.")
    (notifications :initform '() :accessor %pending-notifications
                   :documentation "Broker notifications to signal, oldest first, as
 (condition-type . initargs): see %SIGNAL-NOTIFICATIONS.")
@@ -106,6 +124,56 @@ OPEN-AMQP-CONNECTION makes one that owns its socket, after the handshake."))
                  :channel channel
                  :frame-max frame-max))
 
+(defmethod initialize-instance :after ((conn amqp-connection) &key)
+  (setf (gethash (amqp-connection-channel conn) (%channels conn))
+        (%make-channel-state :open-p t)))
+
+(defun %channel-state (conn &optional (channel (amqp-connection-channel conn)))
+  "CONN's %CHANNEL-STATE for CHANNEL (made on first use, closed)."
+  (or (gethash channel (%channels conn))
+      (setf (gethash channel (%channels conn)) (%make-channel-state))))
+
+(defun %channel-open-p (conn &optional (channel (amqp-connection-channel conn)))
+  (%cs-open-p (%channel-state conn channel)))
+
+(defun %consumer-queues (conn &optional (channel (amqp-connection-channel conn)))
+  "(consumer-tag . queue) for each live consumer on CONN's CHANNEL."
+  (%cs-consumers (%channel-state conn channel)))
+
+(defun (setf %consumer-queues) (value conn &optional (channel (amqp-connection-channel conn)))
+  (setf (%cs-consumers (%channel-state conn channel)) value))
+
+(defun %no-ack-consumers (conn &optional (channel (amqp-connection-channel conn)))
+  "Tags of the no-ack consumers on CONN's CHANNEL: their deliveries are
+settled on arrival and cannot be acked."
+  (%cs-no-ack (%channel-state conn channel)))
+
+(defun (setf %no-ack-consumers) (value conn &optional (channel (amqp-connection-channel conn)))
+  (setf (%cs-no-ack (%channel-state conn channel)) value))
+
+(defun %forget-consumer (conn channel tag)
+  "The consumer TAG on CONN's CHANNEL is gone (the broker cancelled it):
+its tag may be used again for another queue."
+  (let ((state (%channel-state conn channel)))
+    (setf (%cs-consumers state) (remove tag (%cs-consumers state) :key #'car :test #'equal)
+          (%cs-no-ack state) (remove tag (%cs-no-ack state) :test #'equal))))
+
+(defun %enqueue-delivery (conn message)
+  "Add MESSAGE at the end of CONN's pending deliveries in constant time: the
+last cons is kept while the list is the one it was taken from (anything
+that replaces the list makes the next add find its end once)."
+  (let* ((cell (list message))
+         (head (%pending-deliveries conn))
+         (end (%pending-end conn)))
+    (if (null head)
+        (setf (%pending-deliveries conn) cell)
+        (setf (cdr (if (and end (eq (car end) head) (null (cddr end)))
+                       (cdr end)
+                       (last head)))
+              cell))
+    (setf (%pending-end conn) (cons (%pending-deliveries conn) cell))
+    message))
+
 (defun write-amqp-frame (connection frame-or-octets)
   (let ((octets (if (amqp-frame-p frame-or-octets)
                     (encode-frame (amqp-frame-type frame-or-octets)
@@ -116,12 +184,24 @@ OPEN-AMQP-CONNECTION makes one that owns its socket, after the handshake."))
     (setf (%last-sent connection) (get-internal-real-time))
     octets))
 
-(defun read-amqp-frame (connection)
-  (let* ((header (read-amqp-octets (amqp-connection-stream connection) 7))
+(defun read-amqp-frame (connection &optional (source (amqp-connection-stream connection)))
+  "The next frame, read from SOURCE (the connection's stream, or anything
+with a READ-AMQP-OCTETS method). One larger than the connection's
+frame-max (the client's before Tune, the negotiated one after; 0: no
+limit) is an AMQP-FRAME-ERROR before its payload is read: no peer may send
+one, and a non-AMQP peer (an HTTP port) would otherwise make it allocate
+whatever its first octets say."
+  (let* ((header (read-amqp-octets source 7))
          (size (first (binary-protocol:unpack "!I" header :start 3)))
-         (rest (read-amqp-octets (amqp-connection-stream connection) (1+ size)))
-         (octets (concatenate '(simple-array (unsigned-byte 8) (*)) header rest)))
-    (decode-frame octets)))
+         (frame-max (amqp-connection-frame-max connection)))
+    (when (and (plusp frame-max) (> (+ size 8) frame-max))
+      (error 'amqp-frame-error
+             :offset 3
+             :message (format nil "a frame of ~D octets is over the frame-max ~D (not an AMQP 0-9-1 peer?)"
+                              (+ size 8) frame-max)))
+    (let* ((rest (read-amqp-octets source (1+ size)))
+           (octets (concatenate '(simple-array (unsigned-byte 8) (*)) header rest)))
+      (decode-frame octets))))
 
 (defun write-amqp-method (connection name &rest arguments)
   (let* ((channel (or (getf arguments :channel)

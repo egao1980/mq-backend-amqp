@@ -92,12 +92,19 @@ as (name wire-tag multiple)."
             (format nil "the report says why (~A)" e))))))
 
 (deftest integer-and-copied-tags-name-the-reopened-channel-delivery
+  ;; Each on its own run: once b1 is settled, a second ack of it is refused.
   (multiple-value-bind (conn out) (%scripted (%reopen-script))
     (multiple-value-bind (b a1 b1) (%across-a-reopen conn)
       (declare (ignore a1))
       (%written out)
       (mq-protocol:ack b (mq-protocol:mq-message-delivery-tag b1))
       (ok (equal '((:basic-ack 1 nil)) (%acks out)) "integer tag 2 acks wire tag 1")
+      (ok (eq :settled (%refusal (lambda () (mq-protocol:ack b b1))))
+          "and b1 is settled: a second ack is not sent")))
+  (multiple-value-bind (conn out) (%scripted (%reopen-script))
+    (multiple-value-bind (b a1 b1) (%across-a-reopen conn)
+      (declare (ignore a1))
+      (%written out)
       ;; A plain MQ-MESSAGE that carries b1's tag (a copy) maps the same way.
       (mq-protocol:nack b (mq-protocol:make-mq-message
                            :payload "b1" :delivery-tag (mq-protocol:mq-message-delivery-tag b1))
@@ -175,12 +182,13 @@ as (name wire-tag multiple)."
       (ok (= 1 (length (mq-backend-amqp::%pending-deliveries conn)))
           "a1, for QA's consumer, came first and is kept")
       (ok (signals (mq-protocol:ack b b1 :multiple t) 'mq-protocol:mq-error)
-          "a multiple ack of b1 would settle a1 unseen")
-      (ok (signals (mq-protocol:ack b 0 :multiple t) 'mq-protocol:mq-error)
-          "so would an ack of everything")
-      (ok (null (%acks out)))
-      (mq-protocol:ack b b1)
-      (ok (equal '((:basic-ack 2 nil)) (%acks out)) "one by one is fine"))))
+          "a multiple ack of b1 would settle a1 unseen: refused")
+      (ok (null (%acks out)) "nothing was sent for it")
+      (mq-protocol:ack b 0 :multiple t)
+      (ok (equal '((:basic-ack 2 nil)) (%acks out))
+          "an ack of everything handed out acks b1 alone, not as a multiple over a1")
+      (ok (= 1 (length (mq-backend-amqp::%pending-deliveries conn)))
+          "a1 is still kept, unacked, for a poll of QA"))))
 
 (deftest held-back-deliveries-of-a-closed-channel-are-dropped
   ;; A poll a handler unwinds holds its messages back; if the channel

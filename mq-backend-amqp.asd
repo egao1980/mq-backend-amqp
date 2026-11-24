@@ -1,5 +1,5 @@
 (defsystem "mq-backend-amqp"
-  :version "0.2.0"
+  :version "0.2.1"
   :description "Pure CL AMQP 0-9-1 backend for mq-protocol: framing, handshake (SASL PLAIN), heartbeats, Basic.Get, TLS through cl-stack-ssl (RabbitMQ target)"
   :author "egao1980"
   :license "MIT"
@@ -35,7 +35,10 @@
                (:file "evidence-r3-test")
                (:file "delivery-test")
                (:file "heartbeat-test")
-               (:file "codec-url-test"))
+               (:file "codec-url-test")
+               (:file "adversarial-r4-test")
+               (:file "hardening-test")
+               (:file "adversarial-r5-test"))
   :perform (test-op (o c)
                     (unless (symbol-call :rove :run c)
                       (error "tests failed for ~A" (component-name c)))))
