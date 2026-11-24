@@ -95,6 +95,9 @@
            #:amqp-connection-cancelled-consumers
            #:amqp-connection-flow-active
            #:amqp-delivery
-           #:amqp-delivery-consumer-tag))
+           #:amqp-delivery-consumer-tag
+           #:amqp-stale-delivery
+           #:amqp-stale-delivery-tag
+           #:amqp-stale-delivery-reason))
 
 (in-package #:mq-backend-amqp)

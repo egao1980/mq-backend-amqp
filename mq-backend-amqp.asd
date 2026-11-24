@@ -17,7 +17,7 @@
   :in-order-to ((test-op (test-op "mq-backend-amqp/tests"))))
 
 (defsystem "mq-backend-amqp/tests"
-  :depends-on ("mq-backend-amqp" "rove" "usocket" "flexi-streams")
+  :depends-on ("mq-backend-amqp" "rove" "usocket" "flexi-streams" "bordeaux-threads")
   :pathname "tests"
   :serial t
   :components ((:file "package")
@@ -29,7 +29,10 @@
                (:file "notification-test")
                (:file "evidence-r2-test")
                (:file "round3-test")
-               (:file "evidence-r3-test"))
+               (:file "evidence-r3-test")
+               (:file "delivery-test")
+               (:file "heartbeat-test")
+               (:file "codec-url-test"))
   :perform (test-op (o c)
-             (unless (symbol-call :rove :run c)
-               (error "tests failed for ~A" (component-name c)))))
+                    (unless (symbol-call :rove :run c)
+                      (error "tests failed for ~A" (component-name c)))))

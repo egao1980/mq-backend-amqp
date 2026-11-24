@@ -52,10 +52,46 @@ flight, as pika runs on_cancel after dispatching the frame. A handler may
 use the connection, or unwind: POLL-MESSAGES keeps the messages it had
 fetched for the next poll of that queue."))
 
+(define-condition amqp-stale-delivery (mq-protocol:mq-error)
+  ((delivery-tag :initarg :delivery-tag :reader amqp-stale-delivery-tag :initform nil)
+   (reason :initarg :reason :reader amqp-stale-delivery-reason :initform :channel-closed))
+  (:report (lambda (c s)
+             (format s "AMQP ack / nack of delivery ~@[~d ~]not sent: ~a"
+                     (amqp-stale-delivery-tag c)
+                     (case (amqp-stale-delivery-reason c)
+                       (:channel-closed "its channel closed after it was delivered, and the tag now names another message (the broker requeued it when the channel closed)")
+                       (:other-connection "it was delivered on another connection")
+                       (:settled "it was already acked or nacked")
+                       (:no-ack "its consumer is no-ack, so the broker waits for no ack")
+                       (t (amqp-stale-delivery-reason c))))))
+  (:documentation "ACK or NACK of a delivery that is not outstanding on this
+connection's open channel. Nothing is sent: delivery tags are per channel,
+and after a channel closes and reopens the same number names another message
+(pika raises ChannelWrongStateError, aio-pika ChannelInvalidStateError).
+REASON is :CHANNEL-CLOSED (the broker requeued the message when the channel
+closed; it is redelivered), :OTHER-CONNECTION, :SETTLED (already acked or
+nacked) or :NO-ACK. Restart CONTINUE skips the call (ACK / NACK return
+NIL), like the Java client's recovery, which drops acks with stale tags."))
+
+(defun %host-port (host port)
+  "HOST:PORT for reports, an IPv6 literal in brackets ([::1]:5672)."
+  (format nil (if (find #\: host) "[~A]:~D" "~A:~D") host port))
+
 (defun %endpoint (conn)
   (if (amqp-connection-host conn)
-      (format nil "~A:~D" (amqp-connection-host conn) (amqp-connection-port conn))
+      (%host-port (amqp-connection-host conn) (amqp-connection-port conn))
       "amqp stream"))
+
+(defun %unbracket-host (host)
+  "HOST without the brackets of an IPv6 literal (\"[::1]\" → \"::1\"): quri
+keeps them, usocket cannot resolve them, and pika's URLParameters strips
+them too."
+  (if (and (stringp host)
+           (>= (length host) 2)
+           (char= #\[ (char host 0))
+           (char= #\] (char host (1- (length host)))))
+      (subseq host 1 (1- (length host)))
+      host))
 
 (defmacro %with-transport-errors ((endpoint) &body body)
   "Run BODY; a socket, stream or TLS failure becomes AMQP-TRANSPORT-ERROR."
@@ -112,11 +148,18 @@ drops a client silent for two intervals). → T when a heartbeat was sent."
 
 (defun %broker-closed-channel (conn frame method)
   "Channel.Close from the broker: answer Close-Ok and signal it. The
-broker requeues the channel's unacked messages, so the delivered messages
-not handed out yet are dropped: their delivery tags died with the channel."
+broker requeues the channel's unacked messages, so their delivery tags die
+with the channel: the delivered messages not handed out yet are dropped,
+and the tags already handed out are retired (%TAG-OFFSET), so a later ACK
+of one signals AMQP-STALE-DELIVERY instead of acking whatever the reopened
+channel delivers under the same number. Tags are retired whichever channel
+closed (never a wrong ack, at worst a refused one); the next operation
+reopens the default channel when it was the one."
+  (when (eql (amqp-frame-channel frame) (amqp-connection-channel conn))
+    (setf (%channel-open-p conn) nil))
+  (setf (%pending-deliveries conn) '()
+        (%tag-offset conn) (%max-tag conn))
   (write-amqp-method conn :channel-close-ok :channel (amqp-frame-channel frame))
-  (setf (%channel-open-p conn) nil
-        (%pending-deliveries conn) '())
   (apply #'error 'amqp-channel-closed :message "Channel.Close" (%close-args method)))
 
 (defvar *amqp-operation-depth* 0
@@ -182,16 +225,67 @@ and a handler that unwound from inside the read would leave it unread."
                             (write-amqp-method conn :channel-flow-ok :channel (amqp-frame-channel frame)
                                                :active active))))
 
+(defun %readable-within-p (conn seconds)
+  "Does the broker on CONN's socket send something within SECONDS? Plain
+TCP waits on the socket. TLS polls the TLS stream's own non-blocking
+LISTEN: usocket's WAIT-FOR-INPUT calls LISTEN on the socket's stream, and
+on SBCL that reads the descriptor into the socket stream's buffer, but
+under TLS those octets are OpenSSL's."
+  (let ((stream (amqp-connection-stream conn)))
+    (cond
+     ((listen stream) t)
+     ((typep stream 'cl+ssl::ssl-stream)
+      (loop with end = (+ (get-internal-real-time)
+                          (round (* seconds internal-time-units-per-second)))
+            for nap = 0.001 then (min 0.05 (* 2 nap))
+            for left = (/ (- end (get-internal-real-time)) internal-time-units-per-second)
+            unless (plusp left)
+              return nil
+            do (sleep (min nap left))
+            when (listen stream)
+              return t))
+     (t
+      (and (usocket:wait-for-input (%connection-socket conn) :timeout (float seconds)
+                                                             :ready-only t)
+           t)))))
+
+(defun %wait-for-frame (conn)
+  "On a live connection with heartbeats, wait until the broker sends its
+next frame, sending our own heartbeats meanwhile (a reply can take longer
+than the broker's patience with a silent client). Nothing at all from the
+broker for two heartbeat intervals means it or the network is gone (AMQP
+0-9-1 4.2.7; pika's heartbeat timeout): the socket is dropped and
+AMQP-TRANSPORT-ERROR signalled instead of waiting forever. Without
+heartbeats (:heartbeat 0) a read waits as long as it takes."
+  (let ((interval (amqp-connection-heartbeat conn)))
+    (when (and (%connection-socket conn) (plusp interval))
+      (let ((deadline (+ (get-internal-real-time)
+                         (* 2 interval internal-time-units-per-second))))
+        (loop
+          (amqp-heartbeat-tick conn)
+          (let ((left (/ (- deadline (get-internal-real-time))
+                         internal-time-units-per-second)))
+            (unless (plusp left)
+              (%drop-socket conn)
+              (error 'amqp-transport-error
+                     :message (format nil "~A: nothing from the broker for ~D s ~
+                                           (two heartbeat intervals), so it or the network is gone"
+                                      (%endpoint conn) (* 2 interval))))
+            (when (%readable-within-p conn (min left (/ interval 2)))
+              (return))))))))
+
 (defun %next-frame (conn)
   "The next frame that is not a heartbeat or a broker notification.
 → (values frame method-or-nil). A Connection.Close or Channel.Close from
 the broker is answered with its Close-Ok and signalled. Connection.Blocked
 / Unblocked are recorded; Basic.Cancel (consumer cancel notification) and
 Channel.Flow are answered and recorded. None of these is anyone's reply,
-so the RPC in flight keeps waiting for its own."
+so the RPC in flight keeps waiting for its own. A broker silent for two
+heartbeat intervals is gone (%WAIT-FOR-FRAME)."
   (loop
     (let ((frame (%with-transport-errors ((%endpoint conn))
-                                         (read-amqp-frame conn))))
+                   (%wait-for-frame conn)
+                   (read-amqp-frame conn))))
       (cond
        ((heartbeat-frame-p frame))
        ((/= (amqp-frame-type frame) +amqp-frame-method+)
@@ -235,9 +329,18 @@ Any other frame in between is an unexpected frame (%UNEXPECTED-FRAME).
                  :reader amqp-delivery-consumer-tag
                  :documentation "The consumer a Basic.Deliver was for; NIL for Basic.Get.")
    (queue :initarg :queue :initform nil :reader %delivery-get-queue
-          :documentation "The queue of a Basic.Get-Ok."))
+          :documentation "The queue of a Basic.Get-Ok.")
+   (connection :initarg :connection :initform nil :reader %delivery-connection
+               :documentation "The AMQP-CONNECTION it was delivered on.")
+   (settled :initarg :settled :initform nil :accessor %delivery-settled
+            :documentation "NIL while the broker waits for its ack; :ACK or :NACK
+once sent, :NO-ACK for a no-ack consumer's delivery."))
   (:documentation "A message the broker delivered: an MQ-MESSAGE that also
-knows its consumer, so POLL-MESSAGES hands it out for its own queue only."))
+knows its consumer, so POLL-MESSAGES hands it out for its own queue only,
+and its connection, so ACK / NACK send its tag only where it is valid. Its
+MQ-MESSAGE-DELIVERY-TAG is the wire tag plus the connection's %TAG-OFFSET:
+the same as the wire tag until a channel close, unique on the connection
+after one."))
 
 (defun %delivery-queue (conn message)
   "The queue MESSAGE came from: its Basic.Get queue, or the queue its
@@ -247,20 +350,28 @@ consumer reads (recorded by SUBSCRIBE). NIL when unknown."
            (cdr (assoc (amqp-delivery-consumer-tag message) (%consumer-queues conn)
                        :test #'equal)))))
 
-(defun %delivery-message (method properties body &key queue)
-  "An AMQP-DELIVERY for a Basic.Deliver (it names its consumer) or a
-Basic.Get-Ok (QUEUE is the queue it was got from) and its content."
-  (let ((args (amqp-method-arguments method)))
+(defun %delivery-message (conn method properties body &key queue)
+  "An AMQP-DELIVERY on CONN for a Basic.Deliver (it names its consumer) or
+a Basic.Get-Ok (QUEUE is the queue it was got from) and its content. Its
+delivery tag is the wire tag plus CONN's %TAG-OFFSET (see AMQP-DELIVERY)."
+  (let* ((args (amqp-method-arguments method))
+         (consumer (getf args :consumer-tag))
+         (tag (+ (%tag-offset conn) (getf args :delivery-tag))))
+    (setf (%max-tag conn) (max tag (%max-tag conn)))
     (make-instance 'amqp-delivery
                    :key (getf properties :correlation-id)
                    :payload body
                    :headers (getf properties :headers)
-                   :delivery-tag (getf args :delivery-tag)
+                   :delivery-tag tag
                    :redelivered-p (getf args :redelivered)
                    :exchange (getf args :exchange)
                    :topic (getf args :routing-key)
-                   :consumer-tag (getf args :consumer-tag)
-                   :queue queue)))
+                   :consumer-tag consumer
+                   :queue queue
+                   :connection conn
+                   :settled (and consumer
+                                 (member consumer (%no-ack-consumers conn) :test #'equal)
+                                 :no-ack))))
 
 (defun %unexpected-frame (conn text)
   "A frame that no request is waiting for: AMQP 0-9-1 connection exception
@@ -294,7 +405,7 @@ unexpected frame (see %UNEXPECTED-FRAME). → (values method frame)."
           (multiple-value-bind (properties body) (%read-content conn)
             (setf (%pending-deliveries conn)
                   (append (%pending-deliveries conn)
-                          (list (%delivery-message method properties body))))))
+                          (list (%delivery-message conn method properties body))))))
          ((eq name :basic-return)
           ;; An unroutable mandatory publish coming back: not a reply.
           (%read-content conn))
@@ -420,21 +531,28 @@ masked too. This can over-mask a malformed URL, never under-mask it."
   "Parse amqp://[user[:password]@]host[:port][/vhost] (amqps:// for TLS), the
 RabbitMQ URI spec: the vhost is the percent-decoded path after its first
 \"/\" (\"%2f\" is \"/\"); no path means the default vhost \"/\". User and
-password are percent-decoded, so / ? # @ and % in them must be escaped.
+password are percent-decoded, so / ? # @ and % in them must be escaped. An
+IPv6 host is written in brackets and returned without them, as pika does
+(amqp://[::1]:5672/ → :host \"::1\").
 → plist :host :port :user :password :vhost :tls. Errors are MQ-ERRORs that
 print the URL with the password masked (amqp://user:***@host)."
   (let ((shown (%redact-url url)))
-    (flet ((refuse (what)
+    (flet ((refuse (what &key (hint (find #\@ url)))
              (error 'mq-protocol:mq-error
                     :message (format nil "~A: ~A~:[~; (escape % / ? # @ in the user or ~
                                           password as %25 %2F %3F %23 %40)~]"
-                                     what shown (find #\@ url)))))
+                                     what shown hint))))
       (let* ((uri (handler-case (quri:uri url)
-                    (error () (refuse "malformed URL"))))
-             (scheme (and (quri:uri-scheme uri) (string-downcase (quri:uri-scheme uri)))))
+                    ;; Userinfo before an IPv6 literal fails here on a quri
+                    ;; without cl-stack-systems#85: that is not an escaping
+                    ;; problem, so no hint then.
+                    (error () (refuse "malformed URL"
+                                      :hint (and (find #\@ url) (not (search "@[" url)))))))
+             (scheme (and (quri:uri-scheme uri) (string-downcase (quri:uri-scheme uri))))
+             (host (%unbracket-host (quri:uri-host uri))))
         (unless (member scheme '("amqp" "amqps") :test #'equal)
           (refuse "not an amqp:// or amqps:// URL"))
-        (unless (plusp (length (or (quri:uri-host uri) "")))
+        (unless (plusp (length (or host "")))
           (refuse "no host in URL"))
         ;; An unescaped / ? or # in the password ends quri's authority
         ;; early and puts the @host in the path, query or fragment: refuse
@@ -450,7 +568,7 @@ print the URL with the password masked (amqp://user:***@host)."
                  (colon (and userinfo (position #\: userinfo)))
                  (path (quri:uri-path uri)))
             (append
-             (list :host (quri:uri-host uri)
+             (list :host host
                    :port (or (quri:uri-port uri) (if tls 5671 5672))
                    :tls tls
                    :vhost (if (or (null path) (string= path ""))
@@ -470,10 +588,11 @@ print the URL with the password masked (amqp://user:***@host)."
                                    client-properties (connect-timeout 10))
   "Connect to a broker and run the handshake. → an AMQP-CONNECTION that owns
 its socket, with CHANNEL open.
-HOST (\"127.0.0.1\"), PORT (5672, 5671 with TLS), USER / PASSWORD
-(\"guest\"), VHOST (\"/\"), or URL amqp://user:pass@host:port/vhost; explicit
-keywords win over URL parts. TLS through cl-stack-ssl with TLS-VERIFY
-(:required). HEARTBEAT: seconds, NIL for the broker's proposal, 0 for none.
+HOST (\"127.0.0.1\"; an IPv6 address with or without brackets), PORT (5672,
+5671 with TLS), USER / PASSWORD (\"guest\"), VHOST (\"/\"), or URL
+amqp://user:pass@host:port/vhost; explicit keywords win over URL parts. TLS
+through cl-stack-ssl with TLS-VERIFY (:required). HEARTBEAT: seconds, NIL
+for the broker's proposal, 0 for none.
 Signals AMQP-TRANSPORT-ERROR (refused, timed out, TLS) or
 AMQP-CONNECTION-CLOSED (bad login 403, vhost 530), both MQ-CONNECTION-ERRORs."
   (declare (ignore host port user password vhost tls))
@@ -481,33 +600,33 @@ AMQP-CONNECTION-CLOSED (bad login 403, vhost 530), both MQ-CONNECTION-ERRORs."
     (flet ((opt (key default)
              (let ((given (getf args key '%absent)))
                (if (eq given '%absent) (getf from-url key default) given))))
-      (let* ((host (opt :host "127.0.0.1"))
+      (let* ((host (%unbracket-host (opt :host "127.0.0.1")))
              (tls (opt :tls nil))
              (port (opt :port (if tls 5671 5672)))
-             (endpoint (format nil "~A:~D" host port))
+             (endpoint (%host-port host port))
              (socket (%with-transport-errors (endpoint)
-                                             (usocket:socket-connect host port
-                                                                     :element-type '(unsigned-byte 8)
-                                                                     :timeout connect-timeout
-                                                                     :nodelay t)))
+                       (usocket:socket-connect host port
+                                               :element-type '(unsigned-byte 8)
+                                               :timeout connect-timeout
+                                               :nodelay t)))
              (conn nil)
              (done nil))
         (unwind-protect
             (%with-transport-errors (endpoint)
-                                    (let ((stream (if tls
-                                                      (cl+ssl:make-ssl-client-stream (usocket:socket-stream socket)
-                                                                                     :hostname host
-                                                                                     :verify tls-verify)
-                                                      (usocket:socket-stream socket))))
-                                      (setf conn (make-instance 'amqp-connection
-                                                                :stream stream :socket socket
-                                                                :host host :port port :channel channel))
-                                      (%handshake conn :user (opt :user "guest") :password (opt :password "guest")
-                                                       :vhost (opt :vhost "/") :heartbeat heartbeat
-                                                       :frame-max frame-max :channel-max channel-max
-                                                       :locale locale :client-properties client-properties)
-                                      (setf done t)
-                                      conn))
+              (let ((stream (if tls
+                                (cl+ssl:make-ssl-client-stream (usocket:socket-stream socket)
+                                                               :hostname host
+                                                               :verify tls-verify)
+                                (usocket:socket-stream socket))))
+                (setf conn (make-instance 'amqp-connection
+                                          :stream stream :socket socket
+                                          :host host :port port :channel channel))
+                (%handshake conn :user (opt :user "guest") :password (opt :password "guest")
+                                 :vhost (opt :vhost "/") :heartbeat heartbeat
+                                 :frame-max frame-max :channel-max channel-max
+                                 :locale locale :client-properties client-properties)
+                (setf done t)
+                conn))
           (unless done
             (if conn
                 (%drop-socket conn)
@@ -516,15 +635,11 @@ AMQP-CONNECTION-CLOSED (bad login 403, vhost 530), both MQ-CONNECTION-ERRORs."
 
 (defun %wait-for-close-ok (conn)
   "Read until Close-Ok (or the broker's own Close) after our Connection.Close.
-On a plain socket each read waits at most 5 s."
+On a socket (plain or TLS) each read waits at most 5 s."
   (loop
-    (let ((socket (%connection-socket conn))
-          (stream (amqp-connection-stream conn)))
-      (when (and socket
-                 (not (typep stream 'cl+ssl::ssl-stream))
-                 (not (listen stream))
-                 (not (usocket:wait-for-input socket :timeout 5 :ready-only t)))
-        (return nil)))
+    (when (and (%connection-socket conn)
+               (not (%readable-within-p conn 5)))
+      (return nil))
     (let ((frame (read-amqp-frame conn)))
       (when (= (amqp-frame-type frame) +amqp-frame-method+)
         (case (amqp-method-name (decode-method (amqp-frame-payload frame)))

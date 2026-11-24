@@ -78,6 +78,20 @@ POLL-MESSAGES fetched but could not hand out. Each is handed out by a poll
 of its own queue (%DELIVERY-QUEUE).")
    (consumer-queues :initform '() :accessor %consumer-queues
                     :documentation "(consumer-tag . queue) for each SUBSCRIBE on this connection.")
+   (no-ack-consumers :initform '() :accessor %no-ack-consumers
+                     :documentation "Consumer tags SUBSCRIBEd with no-ack: their
+deliveries are settled on arrival and cannot be acked.")
+   (tag-offset :initform 0 :accessor %tag-offset
+               :documentation "Delivery tags are per channel, and a reopened channel
+numbers its deliveries from 1 again. The tags this connection hands out are
+the wire tag plus this offset: the highest tag handed out before the channel
+last closed. A tag at or below it belongs to a closed channel and is never
+sent (AMQP-STALE-DELIVERY).")
+   (max-tag :initform 0 :accessor %max-tag
+            :documentation "The highest delivery tag (offset included) handed out.")
+   (settled-through :initform 0 :accessor %settled-through
+                    :documentation "The highest tag (offset included) a multiple ack or
+nack settled: every delivery up to it is settled.")
    (notifications :initform '() :accessor %pending-notifications
                   :documentation "Broker notifications to signal, oldest first, as
 (condition-type . initargs): see %SIGNAL-NOTIFICATIONS.")
