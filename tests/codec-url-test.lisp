@@ -97,18 +97,18 @@
 
 (deftest live-connect-by-bracketed-ipv6-host
   (with-broker ()
-    (let ((control (handler-case
-                       (mq-backend-amqp:with-amqp-backend (b :host "::1" :port (%port)
-                                                             :user (%user) :password (%password))
-                         (mq-backend-amqp:amqp-declare-queue b "")
-                         :ok)
-                     (error () nil))))
-      (if (null control)
+    (flet ((try (&rest args)
+             (handler-case
+                 (let ((b (apply #'mq-backend-amqp:connect-amqp-backend args)))
+                   (unwind-protect
+                       (progn (mq-backend-amqp:amqp-declare-queue b "") :ok)
+                     (close b)))
+               (error (e) (princ-to-string e)))))
+      (if (not (eq :ok (try :host "::1" :port (%port) :user (%user) :password (%password))))
           (skip "the broker does not answer on ::1")
-          (ok (eq :ok (handler-case
-                          (mq-backend-amqp:with-amqp-backend (b :host "[::1]" :port (%port)
-                                                                :user (%user) :password (%password))
-                            (mq-backend-amqp:amqp-declare-queue b "")
-                            :ok)
-                        (error (e) (princ-to-string e))))
-              ":host \"[::1]\" connects like \"::1\"")))))
+          (progn
+            (ok (eq :ok (try :host "[::1]" :port (%port) :user (%user) :password (%password)))
+                ":host \"[::1]\" connects like \"::1\"")
+            (let ((got (try :url (format nil "amqp://~A:~A@[::1]:~D/%2F" (%user) (%password) (%port)))))
+              (ok (eq :ok got)
+                  (format nil "amqp://user:pass@[::1]:port/%2F connects (got ~A)" got))))))))
