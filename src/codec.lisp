@@ -70,6 +70,26 @@
     (incf (cursor-pos cur) n)
     (subseq (cursor-octets cur) start (+ start n))))
 
+(defun read-float (cur width)
+  "An IEEE 754 big-endian float of WIDTH octets: 4 single, 8 double."
+  (when (< (cursor-remaining cur) width)
+    (error 'amqp-frame-error
+           :offset (cursor-pos cur)
+           :message "truncated float field"))
+  (prog1 (first (binary-protocol:unpack (if (= width 4) "!f" "!d") (cursor-octets cur)
+                                        :start (cursor-pos cur)))
+    (incf (cursor-pos cur) width)))
+
+(defun %decimal-parts (ratio)
+  "→ (values scale unscaled) with RATIO = UNSCALED / 10^SCALE, the form a
+field-table decimal holds (scale octet, signed 32-bit value); NIL when
+RATIO has none."
+  (loop for scale from 0 to 255
+        for unscaled = (* ratio (expt 10 scale))
+        when (integerp unscaled)
+          return (and (<= -2147483648 unscaled 2147483647)
+                      (values scale unscaled))))
+
 (defun string-octets (string)
   (cond
     ((null string)
@@ -129,35 +149,50 @@
             :message (format nil "expected field table, got ~s" value)))))
 
 (defun encode-field-value (buf value)
+  "VALUE's type octet and encoding: :VOID V, T / NIL t, an integer I (32-bit)
+or l (64-bit), a single-float f, a double-float d, a ratio D when it is a
+decimal (scale ≤ 255, signed 32-bit unscaled value), a string S, octets x,
+an alist / plist / hash table F."
   (cond
-    ((eq value :void)
-     (push-byte buf (char-code #\V)))
-    ((eq value t)
-     (push-byte buf (char-code #\t))
-     (push-byte buf 1))
-    ((eq value nil)
-     (push-byte buf (char-code #\t))
-     (push-byte buf 0))
-    ((and (integerp value) (<= -2147483648 value 2147483647))
-     (push-byte buf (char-code #\I))
-     (push-uint buf 4 (ldb (byte 32 0) value)))
-    ((integerp value)
-     (push-byte buf (char-code #\l))
-     (push-uint buf 8 (ldb (byte 64 0) value)))
-    ((stringp value)
-     (push-byte buf (char-code #\S))
-     (encode-longstr buf value))
-    ((and (vectorp value)
-          (every (lambda (b) (typep b '(unsigned-byte 8))) value))
-     (push-byte buf (char-code #\x))
-     (push-uint buf 4 (length value))
-     (push-octets buf value))
-    ((or (consp value) (hash-table-p value))
-     (push-byte buf (char-code #\F))
-     (encode-table buf value))
-    (t
-     (error 'amqp-frame-error
-            :message (format nil "unsupported table value ~s" value)))))
+   ((eq value :void)
+    (push-byte buf (char-code #\V)))
+   ((eq value t)
+    (push-byte buf (char-code #\t))
+    (push-byte buf 1))
+   ((eq value nil)
+    (push-byte buf (char-code #\t))
+    (push-byte buf 0))
+   ((typep value '(signed-byte 32))
+    (push-byte buf (char-code #\I))
+    (push-uint buf 4 (ldb (byte 32 0) value)))
+   ((typep value '(signed-byte 64))
+    (push-byte buf (char-code #\l))
+    (push-uint buf 8 (ldb (byte 64 0) value)))
+   ((typep value 'single-float)
+    (push-byte buf (char-code #\f))
+    (push-octets buf (binary-protocol:pack "!f" value)))
+   ((floatp value)
+    (push-byte buf (char-code #\d))
+    (push-octets buf (binary-protocol:pack "!d" (float value 1d0))))
+   ((and (typep value 'ratio) (%decimal-parts value))
+    (multiple-value-bind (scale unscaled) (%decimal-parts value)
+      (push-byte buf (char-code #\D))
+      (push-byte buf scale)
+      (push-uint buf 4 (ldb (byte 32 0) unscaled))))
+   ((stringp value)
+    (push-byte buf (char-code #\S))
+    (encode-longstr buf value))
+   ((and (vectorp value)
+         (every (lambda (b) (typep b '(unsigned-byte 8))) value))
+    (push-byte buf (char-code #\x))
+    (push-uint buf 4 (length value))
+    (push-octets buf value))
+   ((or (consp value) (hash-table-p value))
+    (push-byte buf (char-code #\F))
+    (encode-table buf value))
+   (t
+    (error 'amqp-frame-error
+           :message (format nil "unsupported table value ~s" value)))))
 
 (defun encode-table (buf value)
   (let ((inner (make-buffer)))
@@ -168,8 +203,12 @@
     (push-octets buf inner)))
 
 (defun decode-field-value (cur)
-  (let ((code (code-char (read-uint cur 1))))
-    (ecase code
+  "One field-table value: its type octet, then the value (AMQP 0-9-1 with
+RabbitMQ's types: t b B s u I i l L f d D S x T F V A). An unknown type
+octet is an AMQP-FRAME-ERROR at its offset."
+  (let* ((at (cursor-pos cur))
+         (code (code-char (read-uint cur 1))))
+    (case code
       (#\t (plusp (read-uint cur 1)))
       (#\b (let ((v (read-uint cur 1)))
              (if (logbitp 7 v) (- v 256) v)))
@@ -183,6 +222,12 @@
       (#\l (let ((v (read-uint cur 8)))
              (if (logbitp 63 v) (- v (ash 1 64)) v)))
       (#\L (read-uint cur 8))
+      (#\f (read-float cur 4))
+      (#\d (read-float cur 8))
+      (#\D (let* ((scale (read-uint cur 1))
+                  (v (read-uint cur 4)))
+             ;; RabbitMQ and pika read the unscaled value as signed.
+             (/ (if (logbitp 31 v) (- v (ash 1 32)) v) (expt 10 scale))))
       (#\S (decode-longstr cur))
       (#\x (read-bytes cur (read-uint cur 4)))
       (#\T (read-uint cur 8))
@@ -194,7 +239,12 @@
               (out '()))
          (loop while (< (cursor-pos cur) end)
                do (push (decode-field-value cur) out))
-         (nreverse out))))))
+         (nreverse out)))
+      (t
+       (error 'amqp-frame-error
+              :offset at
+              :message (format nil "unknown field-table value type ~S (octet ~D) at offset ~D"
+                               code (char-code code) at))))))
 
 (defun decode-table (cur)
   (let* ((n (read-uint cur 4))

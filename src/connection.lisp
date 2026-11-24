@@ -50,9 +50,55 @@
   ((stream :initarg :stream :accessor amqp-connection-stream)
    (channel :initarg :channel :accessor amqp-connection-channel :initform 1)
    (frame-max :initarg :frame-max :accessor amqp-connection-frame-max
-              :initform 131072))
+              :initform 131072)
+   (channel-max :initarg :channel-max :accessor amqp-connection-channel-max
+                :initform 0)
+   (heartbeat :initarg :heartbeat :accessor amqp-connection-heartbeat :initform 0
+              :documentation "Negotiated heartbeat interval in seconds (0: off).")
+   (last-sent :initform (get-internal-real-time) :accessor %last-sent)
+   (server-properties :initform nil :accessor amqp-connection-server-properties)
+   (socket :initarg :socket :initform nil :accessor %connection-socket
+           :documentation "The usocket socket when the connection owns one.")
+   (host :initarg :host :initform nil :reader amqp-connection-host)
+   (port :initarg :port :initform nil :reader amqp-connection-port)
+   (channel-open-p :initform t :accessor %channel-open-p)
+   (closed-p :initform nil :accessor amqp-connection-closed-p)
+   (blocked :initform nil :accessor amqp-connection-blocked
+            :documentation "The broker's Connection.Blocked reason while it holds publishers.")
+   (cancelled :initform '() :accessor amqp-connection-cancelled-consumers
+              :documentation "Consumer tags the broker cancelled with Basic.Cancel
+(their queue was deleted, or its node failed), newest first.")
+   (flow-active :initform t :accessor amqp-connection-flow-active
+                :documentation "NIL after a broker Channel.Flow active=false, until it
+sends active=true again.")
+   (pending :initform '() :accessor %pending-deliveries
+            :documentation "Delivered messages not handed out yet, oldest first:
+Basic.Deliver frames that arrived while waiting for a reply, and messages a
+POLL-MESSAGES fetched but could not hand out. Each is handed out by a poll
+of its own queue (%DELIVERY-QUEUE).")
+   (consumer-queues :initform '() :accessor %consumer-queues
+                    :documentation "(consumer-tag . queue) for each SUBSCRIBE on this connection.")
+   (no-ack-consumers :initform '() :accessor %no-ack-consumers
+                     :documentation "Consumer tags SUBSCRIBEd with no-ack: their
+deliveries are settled on arrival and cannot be acked.")
+   (tag-offset :initform 0 :accessor %tag-offset
+               :documentation "Delivery tags are per channel, and a reopened channel
+numbers its deliveries from 1 again. The tags this connection hands out are
+the wire tag plus this offset: the highest tag handed out before the channel
+last closed. A tag at or below it belongs to a closed channel and is never
+sent (AMQP-STALE-DELIVERY).")
+   (max-tag :initform 0 :accessor %max-tag
+            :documentation "The highest delivery tag (offset included) handed out.")
+   (settled-through :initform 0 :accessor %settled-through
+                    :documentation "The highest tag (offset included) a multiple ack or
+nack settled: every delivery up to it is settled.")
+   (notifications :initform '() :accessor %pending-notifications
+                  :documentation "Broker notifications to signal, oldest first, as
+(condition-type . initargs): see %SIGNAL-NOTIFICATIONS.")
+   (lock :initform (bt2:make-recursive-lock :name "amqp-connection") :reader %connection-lock))
   (:documentation
-   "AMQP 0-9-1 connection over a bidirectional octet STREAM (or OCTET-PIPE)."))
+   "AMQP 0-9-1 connection over a bidirectional octet STREAM (or OCTET-PIPE).
+OPEN-AMQP-CONNECTION makes one that owns its socket, after the handshake."))
 
 (defun make-amqp-connection (&key stream (channel 1) (frame-max 131072))
   (make-instance 'amqp-connection
@@ -67,6 +113,7 @@
                                   (amqp-frame-payload frame-or-octets))
                     frame-or-octets)))
     (write-amqp-octets (amqp-connection-stream connection) octets)
+    (setf (%last-sent connection) (get-internal-real-time))
     octets))
 
 (defun read-amqp-frame (connection)
