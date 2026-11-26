@@ -61,14 +61,18 @@ another channel's reply was awaited, as (reply-code reply-text class-id
 method-id), until an operation on this channel reports it. Consumer tags
 are channel-local too: CONSUMERS is (consumer-tag . queue) for each live
 consumer on the channel, NO-ACK the tags of those that are no-ack; a
-consumer leaves both when the broker cancels it or the channel closes."
+consumer leaves both when the broker cancels it or the channel closes.
+STRAY-CLOSE-OK: our Channel.Close crossed the broker's, which answered it;
+the broker's Close-Ok for ours may still come and is no one's reply, so the
+next method on the channel is skipped if it is a Close-Ok (%NEXT-FRAME)."
   (open-p nil)
   (offset 0 :type integer)
   (max-tag 0 :type integer)
   (unsettled (make-hash-table) :read-only t)
   (close nil)
   (consumers '())
-  (no-ack '()))
+  (no-ack '())
+  (stray-close-ok nil))
 
 (defclass amqp-connection ()
   ((stream :initarg :stream :accessor amqp-connection-stream)
@@ -175,12 +179,15 @@ that replaces the list makes the next add find its end once)."
     message))
 
 (defun write-amqp-frame (connection frame-or-octets)
+  "Write a frame (or its encoded octets) to CONNECTION. On a live socket the
+write is bounded like a read: a broker that takes nothing for two heartbeat
+intervals is gone (%WRITE-OCTETS-WITHIN)."
   (let ((octets (if (amqp-frame-p frame-or-octets)
                     (encode-frame (amqp-frame-type frame-or-octets)
                                   (amqp-frame-channel frame-or-octets)
                                   (amqp-frame-payload frame-or-octets))
                     frame-or-octets)))
-    (write-amqp-octets (amqp-connection-stream connection) octets)
+    (%write-octets-within connection octets)
     (setf (%last-sent connection) (get-internal-real-time))
     octets))
 

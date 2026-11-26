@@ -1,5 +1,5 @@
 (defsystem "mq-backend-amqp"
-  :version "0.2.1"
+  :version "0.2.2"
   :description "Pure CL AMQP 0-9-1 backend for mq-protocol: framing, handshake (SASL PLAIN), heartbeats, Basic.Get, TLS through cl-stack-ssl (RabbitMQ target)"
   :author "egao1980"
   :license "MIT"

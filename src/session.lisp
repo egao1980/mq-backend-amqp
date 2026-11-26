@@ -388,6 +388,97 @@ bound at all, it is a plain READ-AMQP-FRAME."
                                                                          'cl+ssl::ssl-stream))))))
       (read-amqp-frame conn)))
 
+;;; --- bounded writes ----------------------------------------------------------
+
+(defparameter *write-chunk* 4096
+  "Octets written to a live socket at a time when writes are bounded
+(%WRITE-OCTETS-WITHIN): each chunk is progress, and the bound is on how
+long one chunk may take.")
+
+(defun %write-window (conn)
+  "Seconds a write to CONN's socket may make no progress before the broker
+is taken to be gone: two heartbeat intervals, and no later than
+*READ-DEADLINE* (the handshake's CONNECT-TIMEOUT). NIL: no bound
+(:heartbeat 0 after the handshake)."
+  (let* ((interval (amqp-connection-heartbeat conn))
+         (seconds (and (plusp interval) (* 2 interval)))
+         (limit (and *read-deadline*
+                     (max 0 (/ (- *read-deadline* (get-internal-real-time))
+                               internal-time-units-per-second)))))
+    (if (and seconds limit) (min seconds limit) (or seconds limit))))
+
+#+(and sbcl win32)
+(progn
+  (sb-alien:define-alien-type nil
+      (sb-alien:struct %ws-fd-set
+                       ;; u_int fd_count, padded to the SOCKET size on Win64
+                       (count sb-alien:signed)
+                       (array (array sb-alien:signed 64))))
+  (sb-alien:define-alien-type nil
+      (sb-alien:struct %ws-timeval
+                       (sec sb-alien:long)
+                       (usec sb-alien:long)))
+  (sb-alien:define-alien-routine ("select" %ws-select) sb-alien:int
+    (nfds sb-alien:int)
+    (readfds (* t))
+    (writefds (* (sb-alien:struct %ws-fd-set)))
+    (exceptfds (* t))
+    (timeout (* (sb-alien:struct %ws-timeval))))
+
+  (defun %socket-writable-within-p (conn seconds)
+    "Does CONN's socket take octets within SECONDS? Winsock select(): a
+blocking send() to a socket it calls writable does not block. SBCL's
+deadlines do not bound a plain socket's write on Windows, so writes wait
+for this first, chunk by chunk, as reads wait for each octet there."
+    (let ((handle (sb-bsd-sockets:socket-file-descriptor
+                   (usocket:socket (%connection-socket conn)))))
+      (sb-alien:with-alien ((set (sb-alien:struct %ws-fd-set))
+                            (tv (sb-alien:struct %ws-timeval)))
+        (multiple-value-bind (sec frac) (floor (max 0 seconds))
+          (setf (sb-alien:slot set 'count) 1
+                (sb-alien:deref (sb-alien:slot set 'array) 0) handle
+                (sb-alien:slot tv 'sec) sec
+                (sb-alien:slot tv 'usec) (min 999999 (floor (* frac 1000000)))))
+        (let ((rv (%ws-select 0 nil (sb-alien:addr set) nil (sb-alien:addr tv))))
+          (when (minusp rv)
+            (error 'amqp-transport-error
+                   :message (format nil "~A: select() failed: WSA error ~D" (%endpoint conn)
+                                    (sockint::wsa-get-last-error))))
+          (plusp rv))))))
+
+(defun %write-octets-within (conn octets)
+  "Write OCTETS to CONN's stream. On a live socket whose writes are bounded
+(%WRITE-WINDOW), they go in chunks of *WRITE-CHUNK*, and a broker that
+takes none of a chunk for that long (it stopped reading: a paused
+container, a host gone without an RST) is gone: the socket is dropped and
+AMQP-TRANSPORT-ERROR signalled, rather than the write blocking until the
+peer lets go (pika: AMQPHeartbeatTimeout). On SBCL the socket is
+non-blocking (OPEN-AMQP-CONNECTION), so SB-SYS:WITH-DEADLINE bounds each
+chunk, plain or TLS; on Windows each chunk first waits for the socket to
+be writable (%SOCKET-WRITABLE-WITHIN-P). → the number of octets."
+  (let ((stream (amqp-connection-stream conn))
+        (n (length octets)))
+    (if (not (and (%connection-socket conn) (%write-window conn)))
+        (write-amqp-octets stream octets)
+        (flet ((what ()
+                 (if *read-deadline*
+                     "no AMQP handshake"
+                     "the broker took no octets (two heartbeat intervals)")))
+          (loop for start from 0 below n by *write-chunk*
+                for end = (min n (+ start *write-chunk*))
+                do (let ((window (or (%write-window conn) 0)))
+                     #+(and sbcl win32)
+                     (unless (%socket-writable-within-p conn window)
+                       (%drop-socket conn)
+                       (error 'amqp-transport-error
+                              :message (format nil "~A: ~A within ~,1F s" (%endpoint conn) (what) window)))
+                     (%call-with-deadline window (%endpoint conn) (what)
+                                          (lambda ()
+                                            (write-sequence octets stream :start start :end end)
+                                            (force-output stream))
+                                          :conn conn)))
+          n))))
+
 (defun %readable-within-p (conn seconds)
   "Does the broker on CONN's socket send something within SECONDS? Plain
 TCP waits on the socket. TLS polls the TLS stream's own non-blocking
@@ -418,12 +509,17 @@ next frame, sending our own heartbeats meanwhile (a reply can take longer
 than the broker's patience with a silent client). Nothing at all from the
 broker for two heartbeat intervals means it or the network is gone (AMQP
 0-9-1 4.2.7; pika's heartbeat timeout): the socket is dropped and
-AMQP-TRANSPORT-ERROR signalled instead of waiting forever. Without
-heartbeats (:heartbeat 0) a read waits as long as it takes."
+AMQP-TRANSPORT-ERROR signalled instead of waiting forever. The wait ends
+at *READ-DEADLINE* too (the handshake's CONNECT-TIMEOUT), with \"no AMQP
+handshake\": usocket's WAIT-FOR-INPUT is a select that SBCL's deadlines do
+not interrupt. Without heartbeats (:heartbeat 0) a read waits as long as it
+takes (bounded by %READ-FRAME-WITHIN)."
   (let ((interval (amqp-connection-heartbeat conn)))
     (when (and (%connection-socket conn) (plusp interval))
-      (let ((deadline (+ (get-internal-real-time)
-                         (* 2 interval internal-time-units-per-second))))
+      (let* ((silent (+ (get-internal-real-time)
+                        (* 2 interval internal-time-units-per-second)))
+             (limit *read-deadline*)
+             (deadline (if limit (min silent limit) silent)))
         (loop
           (amqp-heartbeat-tick conn)
           (let ((left (/ (- deadline (get-internal-real-time))
@@ -431,9 +527,12 @@ heartbeats (:heartbeat 0) a read waits as long as it takes."
             (unless (plusp left)
               (%drop-socket conn)
               (error 'amqp-transport-error
-                     :message (format nil "~A: nothing from the broker for ~D s ~
-                                           (two heartbeat intervals), so it or the network is gone"
-                                      (%endpoint conn) (* 2 interval))))
+                     :message (if (and limit (<= limit silent))
+                                  (format nil "~A: no AMQP handshake within the connect timeout"
+                                          (%endpoint conn))
+                                  (format nil "~A: nothing from the broker for ~D s ~
+                                               (two heartbeat intervals), so it or the network is gone"
+                                          (%endpoint conn) (* 2 interval)))))
             (when (%readable-within-p conn (min left (/ interval 2)))
               (return))))))))
 
@@ -444,11 +543,12 @@ the broker is answered with its Close-Ok and signalled (a Channel.Close
 of a channel other than *AWAITED-CHANNEL* is recorded instead).
 Connection.Blocked / Unblocked are recorded; Basic.Cancel (consumer cancel
 notification) and Channel.Flow are answered and recorded. None of these is
-anyone's reply, so the RPC in flight keeps waiting for its own. A broker
-silent for two heartbeat intervals is gone (%WAIT-FOR-FRAME), and so is
-one that stops for that long in the middle of a frame (%READ-FRAME-WITHIN).
-With POLL, nothing is waited for: → (values NIL NIL) when the broker has
-sent nothing more."
+anyone's reply, so the RPC in flight keeps waiting for its own. Nor is the
+broker's Close-Ok for a Channel.Close of ours that crossed its own (see
+%CS-STRAY-CLOSE-OK): it is skipped. A broker silent for two heartbeat
+intervals is gone (%WAIT-FOR-FRAME), and so is one that stops for that long
+in the middle of a frame (%READ-FRAME-WITHIN). With POLL, nothing is waited
+for: → (values NIL NIL) when the broker has sent nothing more."
   (loop
     (when (and poll
                (not (%with-transport-errors ((%endpoint conn))
@@ -466,18 +566,24 @@ sent nothing more."
         ((/= (amqp-frame-type frame) +amqp-frame-method+)
          (return (values frame nil)))
         (t
-         (let ((method (decode-method (amqp-frame-payload frame))))
-           (case (amqp-method-name method)
-             (:connection-close (%broker-closed-connection conn method))
-             (:channel-close (%broker-closed-channel conn frame method))
-             (:connection-blocked
-              (setf (amqp-connection-blocked conn)
-                    (or (getf (amqp-method-arguments method) :reason) t)))
-             (:connection-unblocked
-              (setf (amqp-connection-blocked conn) nil))
-             (:basic-cancel (%broker-cancelled-consumer conn frame method))
-             (:channel-flow (%broker-flow conn frame method))
-             (t (return (values frame method))))))))))
+         (let* ((method (decode-method (amqp-frame-payload frame)))
+                (name (amqp-method-name method))
+                (state (gethash (amqp-frame-channel frame) (%channels conn)))
+                (stray (and state (%cs-stray-close-ok state)
+                            (progn (setf (%cs-stray-close-ok state) nil)
+                              (eq name :channel-close-ok)))))
+           (unless stray
+             (case name
+               (:connection-close (%broker-closed-connection conn method))
+               (:channel-close (%broker-closed-channel conn frame method))
+               (:connection-blocked
+                (setf (amqp-connection-blocked conn)
+                      (or (getf (amqp-method-arguments method) :reason) t)))
+               (:connection-unblocked
+                (setf (amqp-connection-blocked conn) nil))
+               (:basic-cancel (%broker-cancelled-consumer conn frame method))
+               (:channel-flow (%broker-flow conn frame method))
+               (t (return (values frame method)))))))))))
 
 (defun %read-content (conn)
   "The content header and body frames after Basic.Deliver / Get-Ok / Return.
@@ -626,13 +732,15 @@ or after an unexpected frame)."
 of the method names REPLIES on that channel. A broker Close of that channel
 or of the connection in between is signalled (AMQP-CHANNEL-CLOSED /
 AMQP-CONNECTION-CLOSED); a Channel.Close of another channel is not its
-answer (%BROKER-CLOSED-CHANNEL). Broker notifications read on the way
-(AMQP-CONSUMER-CANCELLED) are signalled after the reply, unless AMQP-RPC
-runs inside a backend operation, which signals them when it is done. A
-non-local exit before the reply is read drops the connection
-(%WITH-REPLY-GUARD). Channel.Open and Channel.Close sent this way are
-tracked, so the backend knows which channels are open. → the reply
-AMQP-METHOD."
+answer (%BROKER-CLOSED-CHANNEL). A Channel.Close sent this way that crosses
+the broker's is answered by it (AMQP-CHANNEL-CLOSED), and the broker's
+Close-Ok for ours, if it comes, is skipped later (%CS-STRAY-CLOSE-OK), as
+pika does. Broker notifications read on the way (AMQP-CONSUMER-CANCELLED)
+are signalled after the reply, unless AMQP-RPC runs inside a backend
+operation, which signals them when it is done. A non-local exit before the
+reply is read drops the connection (%WITH-REPLY-GUARD). Channel.Open and
+Channel.Close sent this way are tracked, so the backend knows which
+channels are open. → the reply AMQP-METHOD."
   (let ((channel (or (getf arguments :channel) (amqp-connection-channel connection))))
     (%with-notifications (connection)
       (bt2:with-recursive-lock-held ((%connection-lock connection))
@@ -641,7 +749,14 @@ AMQP-METHOD."
                        (%with-reply-guard (connection)
                          (%with-transport-errors ((%endpoint connection))
                            (apply #'write-amqp-method connection name arguments))
-                         (values (%await connection replies))))))
+                         (handler-bind ((amqp-channel-closed
+                                          (lambda (c)
+                                            (declare (ignore c))
+                                            (when (eq name :channel-close)
+                                              (setf (%cs-stray-close-ok
+                                                     (%channel-state connection channel))
+                                                    t)))))
+                           (values (%await connection replies)))))))
           (case name
             (:channel-open (setf (%cs-open-p (%channel-state connection channel)) t))
             (:channel-close (%retire-channel connection channel)))
@@ -871,11 +986,19 @@ both MQ-CONNECTION-ERRORs."
              (socket (%with-transport-errors (endpoint)
                        ;; On SBCL usocket's :TIMEOUT is also the stream's read
                        ;; timeout unless :READ-TIMEOUT says otherwise.
-                       (usocket:socket-connect host port
-                                               :element-type '(unsigned-byte 8)
-                                               :timeout connect-timeout
-                                               #+sbcl :read-timeout #+sbcl nil
-                                               :nodelay t)))
+                       (let ((socket (usocket:socket-connect host port
+                                                             :element-type '(unsigned-byte 8)
+                                                             :timeout connect-timeout
+                                                             #+sbcl :read-timeout #+sbcl nil
+                                                             :nodelay t)))
+                         ;; Non-blocking, a full socket buffer makes SBCL wait
+                         ;; in WAIT-UNTIL-FD-USABLE, which SB-SYS:WITH-DEADLINE
+                         ;; bounds; a blocking write(2) it does not
+                         ;; (%WRITE-OCTETS-WITHIN). Windows waits for
+                         ;; writability instead.
+                         #+(and sbcl (not win32))
+                         (setf (sb-bsd-sockets:non-blocking-mode (usocket:socket socket)) t)
+                         socket)))
              (conn nil)
              (done nil))
         (unwind-protect
