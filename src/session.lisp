@@ -446,38 +446,79 @@ for this first, chunk by chunk, as reads wait for each octet there."
                                     (sockint::wsa-get-last-error))))
           (plusp rv))))))
 
+(defun %pending-input (conn)
+  "How many octets the broker sent that CONN's socket holds unread, as the
+kernel counts them (up to 8192 on unix: a peek), or NIL when unknown. It
+grows while the broker sends, even when nothing reads them."
+  (let ((socket (%connection-socket conn)))
+    (and socket
+         (handler-case
+             (progn
+               #+(and sbcl win32)
+               (usocket::bytes-available-for-read socket)
+               #+(and sbcl (not win32))
+               (let ((buf (make-array 8192 :element-type '(unsigned-byte 8))))
+                 (declare (dynamic-extent buf))
+                 (multiple-value-bind (got length)
+                     (sb-bsd-sockets:socket-receive (usocket:socket socket) buf nil
+                                                    :peek t :dontwait t)
+                   (if got length 0)))
+               #-sbcl nil)
+           ((or usocket:socket-error #+sbcl sb-bsd-sockets:socket-error) () nil)))))
+
 (defun %write-octets-within (conn octets)
   "Write OCTETS to CONN's stream. On a live socket whose writes are bounded
 (%WRITE-WINDOW), they go in chunks of *WRITE-CHUNK*, and a broker that
-takes none of a chunk for that long (it stopped reading: a paused
-container, a host gone without an RST) is gone: the socket is dropped and
-AMQP-TRANSPORT-ERROR signalled, rather than the write blocking until the
-peer lets go (pika: AMQPHeartbeatTimeout). On SBCL the socket is
-non-blocking (OPEN-AMQP-CONNECTION), so SB-SYS:WITH-DEADLINE bounds each
-chunk, plain or TLS; on Windows each chunk first waits for the socket to
-be writable (%SOCKET-WRITABLE-WITHIN-P). → the number of octets."
+takes none of a chunk for that long and sent nothing meanwhile (it stopped
+reading and is gone: a paused container, a host gone without an RST) is
+gone: the socket is dropped and AMQP-TRANSPORT-ERROR signalled, rather than
+the write blocking until the peer lets go (pika: AMQPHeartbeatTimeout). A
+broker that stops reading but keeps sending (RabbitMQ under a resource
+alarm: Connection.Blocked, then heartbeats) is waited for, as pika's
+heartbeat checker counts octets received; what it sent is read later
+(%PENDING-INPUT). On SBCL the socket is non-blocking (OPEN-AMQP-CONNECTION),
+so SB-SYS:WITH-DEADLINE bounds each chunk, plain or TLS; on Windows each
+chunk first waits for the socket to be writable (%SOCKET-WRITABLE-WITHIN-P).
+During the handshake, the connect timeout is the bound, whatever the
+broker sends. → the number of octets."
   (let ((stream (amqp-connection-stream conn))
         (n (length octets)))
     (if (not (and (%connection-socket conn) (%write-window conn)))
         (write-amqp-octets stream octets)
-        (flet ((what ()
-                 (if *read-deadline*
-                     "no AMQP handshake"
-                     "the broker took no octets (two heartbeat intervals)")))
-          (loop for start from 0 below n by *write-chunk*
-                for end = (min n (+ start *write-chunk*))
-                do (let ((window (or (%write-window conn) 0)))
-                     #+(and sbcl win32)
-                     (unless (%socket-writable-within-p conn window)
-                       (%drop-socket conn)
-                       (error 'amqp-transport-error
-                              :message (format nil "~A: ~A within ~,1F s" (%endpoint conn) (what) window)))
-                     (%call-with-deadline window (%endpoint conn) (what)
-                                          (lambda ()
-                                            (write-sequence octets stream :start start :end end)
-                                            (force-output stream))
-                                          :conn conn)))
-          n))))
+        (let ((seen (and (null *read-deadline*) (%pending-input conn))))
+          (flet ((what ()
+                   (if *read-deadline*
+                       "no AMQP handshake"
+                       "the broker took no octets and sent none (two heartbeat intervals)"))
+                 (broker-sent-p ()
+                   ;; Did the broker send octets since we last looked?
+                   (let ((now (and seen (%pending-input conn))))
+                     (when (and now (> now seen))
+                       (setf seen now)
+                       t))))
+            (loop for start from 0 below n by *write-chunk*
+                  for end = (min n (+ start *write-chunk*))
+                  do (let ((window (or (%write-window conn) 0)))
+                       #+(and sbcl win32)
+                       (loop until (%socket-writable-within-p conn window)
+                             unless (broker-sent-p)
+                               do (%drop-socket conn)
+                                  (error 'amqp-transport-error
+                                         :message (format nil "~A: ~A within ~,1F s"
+                                                          (%endpoint conn) (what) window)))
+                       (%call-with-deadline
+                        window (%endpoint conn) (what)
+                        (lambda ()
+                          (handler-bind (#+sbcl
+                                         (sb-sys:deadline-timeout
+                                           (lambda (c)
+                                             (when (broker-sent-p)
+                                               (let ((defer (find-restart 'sb-sys:defer-deadline c)))
+                                                 (when defer (invoke-restart defer window)))))))
+                            (write-sequence octets stream :start start :end end)
+                            (force-output stream)))
+                        :conn conn)))
+            n)))))
 
 (defun %readable-within-p (conn seconds)
   "Does the broker on CONN's socket send something within SECONDS? Plain
