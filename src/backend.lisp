@@ -65,13 +65,20 @@ connection (Connection.Close, socket released) however BODY exits."
     (t (princ-to-string destination))))
 
 (defun %destination-pair (destination message)
+  "Exchange and routing key for a publish of MESSAGE to DESTINATION.
+A destination given wins: (exchange . routing-key), or a queue name on the
+default exchange. Only a NIL destination falls back to MESSAGE's own
+exchange and topic, so a delivered message (whose Get-Ok / Deliver filled
+both in) published to another queue goes to that queue, as in mq-protocol's
+in-memory backend, mq-backend-kafka and pika."
   (cond
     ((and (consp destination) (not (keywordp (car destination))))
      (values (car destination) (cdr destination)))
-    (t
+    ((null destination)
      (values (or (mq-protocol:mq-message-exchange message) "")
-             (or (mq-protocol:mq-message-topic message)
-                 (%dest-string destination))))))
+             (or (mq-protocol:mq-message-topic message) "")))
+    (t
+     (values "" (%dest-string destination)))))
 
 (defun %live-p (conn)
   "Does CONN own a socket (a broker on the other end that answers)?"
