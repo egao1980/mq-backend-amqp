@@ -70,9 +70,16 @@ A destination given wins: (exchange . routing-key), or a queue name on the
 default exchange. Only a NIL destination falls back to MESSAGE's own
 exchange and topic, so a delivered message (whose Get-Ok / Deliver filled
 both in) published to another queue goes to that queue, as in mq-protocol's
-in-memory backend, mq-backend-kafka and pika."
+in-memory backend, mq-backend-kafka and pika. A cons headed by a keyword
+((:queue . \"q\")) is neither: MQ-ERROR, rather than a routing key made of
+its printed form."
   (cond
-    ((and (consp destination) (not (keywordp (car destination))))
+    ((and (consp destination) (keywordp (car destination)))
+     (error 'mq-protocol:mq-error
+            :message (format nil "AMQP destination ~S: give a queue name or ~
+                                  (exchange . routing-key)"
+                             destination)))
+    ((consp destination)
      (values (car destination) (cdr destination)))
     ((null destination)
      (values (or (mq-protocol:mq-message-exchange message) "")
@@ -114,6 +121,33 @@ the outermost one) is done, with the lock released (%WITH-NOTIFICATIONS)."
                        (subseq payload start (min (length payload) (+ start chunk)))
                        :channel channel)))))
 
+(defun %wait-while-blocked (conn channel)
+  "While the broker holds CONN's publishers (Connection.Blocked) and CONN
+has a BLOCKED-TIMEOUT, read what the broker sends (deliveries kept,
+heartbeats sent and counted) until it sends Connection.Unblocked. Past the
+timeout the socket is dropped and AMQP-BLOCKED-TIMEOUT signalled, as pika's
+blocked_connection_timeout closes the connection. Without a timeout, or
+not blocked: nothing. The caller holds the lock."
+  (let ((timeout (amqp-connection-blocked-timeout conn)))
+    (when (and timeout (amqp-connection-blocked conn) (%live-p conn))
+      (let ((deadline (+ (get-internal-real-time)
+                         (round (* timeout internal-time-units-per-second)))))
+        (loop while (amqp-connection-blocked conn)
+              do (let ((left (/ (- deadline (get-internal-real-time))
+                                internal-time-units-per-second)))
+                   (unless (plusp left)
+                     (let ((reason (amqp-connection-blocked conn)))
+                       (%drop-socket conn)
+                       (error 'amqp-blocked-timeout
+                              :message (format nil "~A: the broker kept the connection blocked~
+                                                    ~@[ (~A)~] for ~,1F s (blocked-connection-timeout)"
+                                               (%endpoint conn) (and (stringp reason) reason)
+                                               timeout))))
+                   (amqp-heartbeat-tick conn)
+                   (when (%with-transport-errors ((%endpoint conn))
+                           (%readable-within-p conn (min left 1/5)))
+                     (%drain-incoming conn channel))))))))
+
 (defmethod mq-protocol:publish ((backend amqp-backend) destination message &key)
   "Basic.Publish of MESSAGE (or a payload) to DESTINATION: a queue name on
 the default exchange, or (exchange . routing-key). Every frame is encoded
@@ -149,6 +183,7 @@ fails instead of being discarded. → the MQ-MESSAGE."
                                                    (princ-to-string (mq-protocol:mq-message-key msg))))))
                           (%body-frames (%conn backend) payload channel)))))
     (%with-backend-connection (conn backend)
+      (%wait-while-blocked conn channel)
       (%with-reply-guard (conn)
         (dolist (frame frames)
           (write-amqp-frame conn frame))))
@@ -238,14 +273,18 @@ the broker name it. → (values queue-name message-count consumer-count)."
 (defun %basic-get (backend conn queue)
   "One Basic.Get on BACKEND's channel. → an AMQP-DELIVERY, or NIL when the
 queue is empty. The Get-Ok and its content frames are one reply
-(%WITH-REPLY-GUARD)."
+(%WITH-REPLY-GUARD), read with the channel awaited, so a broker Close of
+another channel in between is recorded for that channel, not taken for
+this request's answer."
   (let ((channel (amqp-backend-channel backend)))
     (%with-reply-guard (conn)
       (let ((reply (amqp-rpc conn :basic-get '(:basic-get-ok :basic-get-empty)
                                   :channel channel
                                   :reserved-1 0 :queue queue :no-ack nil)))
         (when (eq :basic-get-ok (amqp-method-name reply))
-          (multiple-value-bind (properties body) (%read-content conn)
+          (multiple-value-bind (properties body)
+              (let ((*awaited-channel* channel))
+                (%read-content conn))
             (%delivery-message conn channel reply properties body :queue queue)))))))
 
 (defun %given-tag (message)
@@ -273,8 +312,9 @@ MESSAGE is not outstanding on CHANNEL (see AMQP-STALE-DELIVERY).
 A multiple ack settles every unsettled delivery up to its tag; it is sent
 with the highest of them, never with a tag already settled (the broker
 would close the channel). A tag above every tag handed out is sent as
-given (deliveries read by other means). The caller holds the connection
-lock."
+given (deliveries read by other means), but not with MULTIPLE: that would
+settle deliveries still in the socket, which no one has seen (MQ-ERROR).
+The caller holds the connection lock."
   (let* ((state (%channel-state conn channel))
          (offset (%cs-offset state))
          (unsettled (%cs-unsettled state))
@@ -292,6 +332,12 @@ lock."
        (error 'mq-protocol:mq-error
               :message (format nil "~S has no delivery tag to ack or nack" message)))
       ((<= tag offset) (values nil nil :channel-closed))
+      ((and multiple (> tag (%cs-max-tag state)))
+       (error 'mq-protocol:mq-error
+              :message (format nil "a multiple ack / nack up to delivery ~D, above every ~
+                                    delivery handed out (~D), would settle deliveries not ~
+                                    read yet"
+                               tag (%cs-max-tag state))))
       ((> tag (%cs-max-tag state)) (values (- tag offset) tag nil))
       (multiple
        (let ((top (%highest-unsettled unsettled tag)))

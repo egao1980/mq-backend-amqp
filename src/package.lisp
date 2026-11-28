@@ -98,6 +98,8 @@
            #:amqp-delivery-consumer-tag
            #:amqp-stale-delivery
            #:amqp-stale-delivery-tag
-           #:amqp-stale-delivery-reason))
+           #:amqp-stale-delivery-reason
+           #:amqp-blocked-timeout
+           #:amqp-connection-blocked-timeout))
 
 (in-package #:mq-backend-amqp)
