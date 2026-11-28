@@ -455,9 +455,32 @@ for this first, chunk by chunk, as reads wait for each octet there."
                                     (sockint::wsa-get-last-error))))
           (plusp rv))))))
 
+(defun %fionread (fd)
+  "Octets the kernel holds unread on socket descriptor FD, or NIL when
+unknown here or the call fails. Linux: ioctl FIONREAD (SIOCINQ), called
+directly (a variadic argument is passed like any other there). macOS:
+getsockopt SO_NREAD, since ioctl's variadic argument goes on the stack on
+arm64, which a plain foreign call does not do."
+  (declare (ignorable fd))
+  #+linux
+  (cffi:with-foreign-object (n :int)
+    (setf (cffi:mem-ref n :int) 0)
+    (and (zerop (cffi:foreign-funcall "ioctl" :int fd :unsigned-long #x541B :pointer n :int))
+         (cffi:mem-ref n :int)))
+  #+darwin
+  (cffi:with-foreign-objects ((n :int) (len :uint32))
+    (setf (cffi:mem-ref n :int) 0
+          (cffi:mem-ref len :uint32) 4)
+    ;; SOL_SOCKET #xffff, SO_NREAD #x1020
+    (and (zerop (cffi:foreign-funcall "getsockopt" :int fd :int #xffff :int #x1020
+                                                   :pointer n :pointer len :int))
+         (cffi:mem-ref n :int)))
+  #-(or linux darwin)
+  nil)
+
 (defun %pending-input (conn)
   "How many octets the broker sent that CONN's socket holds unread, as the
-kernel counts them (FIONREAD; on a unix without it, a peek of at most 8192
+kernel counts them (FIONREAD, %FIONREAD; else a peek of at most 8192
 octets), or NIL when unknown. It grows while the broker sends, even when
 nothing reads them, however much already waits (a prefetching consumer)."
   (let ((socket (%connection-socket conn)))
@@ -467,22 +490,13 @@ nothing reads them, however much already waits (a prefetching consumer)."
                #+(and sbcl win32)
                (usocket::bytes-available-for-read socket)
                #+(and sbcl (not win32))
-               (let* ((fd (sb-bsd-sockets:socket-file-descriptor (usocket:socket socket)))
-                      (fionread #+linux #x541B #+(or darwin bsd) #x4004667F
-                                #-(or linux darwin bsd) nil)
-                      (counted (and fionread
-                                    (sb-alien:with-alien ((n sb-alien:int 0))
-                                      (and (sb-unix:unix-ioctl
-                                            fd fionread
-                                            (sb-alien:cast (sb-alien:addr n) (* char)))
-                                           n)))))
-                 (or counted
-                     (let ((buf (make-array 8192 :element-type '(unsigned-byte 8))))
-                       (declare (dynamic-extent buf))
-                       (multiple-value-bind (got length)
-                           (sb-bsd-sockets:socket-receive (usocket:socket socket) buf nil
-                                                          :peek t :dontwait t)
-                         (if got length 0)))))
+               (or (%fionread (sb-bsd-sockets:socket-file-descriptor (usocket:socket socket)))
+                   (let ((buf (make-array 8192 :element-type '(unsigned-byte 8))))
+                     (declare (dynamic-extent buf))
+                     (multiple-value-bind (got length)
+                         (sb-bsd-sockets:socket-receive (usocket:socket socket) buf nil
+                                                        :peek t :dontwait t)
+                       (if got length 0))))
                #-sbcl nil)
            ((or usocket:socket-error #+sbcl sb-bsd-sockets:socket-error) () nil)))))
 

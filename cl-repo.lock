@@ -29,7 +29,9 @@
  (:system "cl-unicode" :version "0.1.7" :index-digest
   "sha256:8416bb8e9a5f541464ed7fe6bd2c88ba022829b4e2dedb9392d6426f8655db47"
   :registry "https://ghcr.io")
- (:system "cl-utilities" :version "latest" :index-digest "" :registry "")
+ (:system "cl-utilities" :version "latest" :index-digest
+  "sha256:628ec42733ad8579f4a585fd5293f6a8975a24c17cb9ee118843ebaf385a57af"
+  :registry "https://ghcr.io")
  (:system "dissect" :version "1.0.0" :index-digest
   "sha256:ad260c48c9d7e7551f83c25d859ac1ad1c708e24c11ef727ddc675658f1b1d2c"
   :registry "https://ghcr.io")
