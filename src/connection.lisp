@@ -95,6 +95,11 @@ starts open.")
    (closed-p :initform nil :accessor amqp-connection-closed-p)
    (blocked :initform nil :accessor amqp-connection-blocked
             :documentation "The broker's Connection.Blocked reason while it holds publishers.")
+   (blocked-timeout :initarg :blocked-timeout :initform nil
+                    :accessor amqp-connection-blocked-timeout
+                    :documentation "Seconds a publish waits for the broker to lift its
+Connection.Blocked before the connection is dropped (AMQP-BLOCKED-TIMEOUT);
+NIL: publish regardless, as before (pika's blocked_connection_timeout).")
    (cancelled :initform '() :accessor amqp-connection-cancelled-consumers
               :documentation "Consumer tags the broker cancelled with Basic.Cancel
 (their queue was deleted, or its node failed), newest first.")

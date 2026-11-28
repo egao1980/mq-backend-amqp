@@ -1,5 +1,5 @@
 (defsystem "mq-backend-amqp"
-  :version "0.2.2"
+  :version "0.3.0"
   :description "Pure CL AMQP 0-9-1 backend for mq-protocol: framing, handshake (SASL PLAIN), heartbeats, Basic.Get, TLS through cl-stack-ssl (RabbitMQ target)"
   :author "egao1980"
   :license "MIT"
@@ -20,7 +20,7 @@
   :in-order-to ((test-op (test-op "mq-backend-amqp/tests"))))
 
 (defsystem "mq-backend-amqp/tests"
-  :depends-on ("mq-backend-amqp" "rove" "usocket" "flexi-streams" "bordeaux-threads")
+  :depends-on ("mq-backend-amqp" "rove" "usocket" "flexi-streams" "bordeaux-threads" "trivial-gray-streams")
   :pathname "tests"
   :serial t
   :components ((:file "package")
@@ -40,7 +40,8 @@
                (:file "hardening-test")
                (:file "adversarial-r5-test")
                (:file "adversarial-r6-test")
-               (:file "release-022-test"))
+               (:file "release-022-test")
+               (:file "leftovers-014-test"))
   :perform (test-op (o c)
                     (unless (symbol-call :rove :run c)
                       (error "tests failed for ~A" (component-name c)))))
